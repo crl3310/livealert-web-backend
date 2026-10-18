@@ -7,7 +7,7 @@ from urllib.parse import unquote, urlsplit
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from accounts import get_station_scope, route_unassigned
+from accounts import get_current_account, get_station_scope, route_unassigned
 from firebase import get_db
 
 router = APIRouter(prefix="/history", tags=["History"])
@@ -342,7 +342,12 @@ class RemarksIn(BaseModel):
 
 
 @router.patch("/{report_id}/remarks")
-def save_report_remarks(report_id: str, body: RemarksIn, station_id: str | None = Depends(get_station_scope)):
+def save_report_remarks(
+    report_id: str,
+    body: RemarksIn,
+    station_id: str | None = Depends(get_station_scope),
+    account: dict = Depends(get_current_account),
+):
     """Saves the admin's remarks on a resolved report and flips haveRemarks to True."""
     details = body.additionalDetails.strip()
     resolution = body.resolution.strip()
@@ -366,7 +371,7 @@ def save_report_remarks(report_id: str, body: RemarksIn, station_id: str | None 
             # The admin who answered the emergency (saved with the resolved status).
             # Only reports resolved before this feature fall back to whoever is typing.
             "addedBy": (data.get("resolvedBy") or body.adminName or "").strip() or "Unknown admin",
-            "addedById": (data.get("resolvedById") or body.adminId or "").strip(),
+            "addedById": (data.get("resolvedById") or account["id"]).strip(),
             "addedAt": datetime.now(timezone.utc).isoformat(),
         },
     })

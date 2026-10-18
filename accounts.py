@@ -1,12 +1,14 @@
+import re
 from datetime import datetime, timezone
 from math import atan2, cos, radians, sin, sqrt
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from firebase import get_db
+from security import get_verified_token
 
 router = APIRouter(prefix="/accounts", tags=["Accounts"])
 
@@ -36,14 +38,11 @@ router = APIRouter(prefix="/accounts", tags=["Accounts"])
 #                        endpoint is shared with the mobile app), so the
 #                        block happens here, at the page-permission layer.
 #
-# Identity: this project doesn't verify a signed token on every request, so
-# the caller is identified the same way the rest of this file already treats
-# accounts — by Firestore doc id. The frontend sends that id back on every
-# request as the X-Account-Id header (set right after login). That's fine
-# for gating which *pages* someone sees, but it's UX, not real security —
-# anyone who can set a request header can claim to be any account id. Put a
-# real auth check (signed token / session cookie) in front of this once one
-# exists.
+# Identity: every request must carry the Firebase ID token returned by
+# /auth/login, sent as `Authorization: Bearer <token>`. The token is verified
+# server-side (see security.py) and the caller is the verified uid, which is
+# also the Responders document id. A client can no longer claim to be someone
+# else by sending an account id; the old X-Account-Id header is ignored.
 #
 # Default-DENY: a missing/blank role falls back to "Responder" (see
 # get_current_account / _serialize), which is mobile-only, i.e. zero pages —
@@ -58,6 +57,8 @@ SUPER_ADMIN_EXTRA_PAGES = {"stations"}
 ADMIN_LEVEL_ROLES = {"super_admin", "responder_admin"}
 # The only fields a station admin may change on someone else's account.
 STATION_ADMIN_EDITABLE_FIELDS = {"role", "status", "unitId"}
+# Roles that may be given to a brand-new account (lower-cased).
+ALLOWED_NEW_ACCOUNT_ROLES = {"responder", "responder_admin", "super_admin"}
 # Roles a station admin may hand out (lower-cased): Responder or Admin, never Super Admin.
 STATION_ADMIN_ASSIGNABLE_ROLES = {"responder", "responder_admin"}
 
@@ -77,25 +78,24 @@ def get_allowed_pages(role: str) -> set[str]:
     return RESTRICTED_PAGES
 
 
-def get_current_account(x_account_id: str = Header(None, alias="X-Account-Id")) -> dict:
+def get_current_account(token: dict = Depends(get_verified_token)) -> dict:
     """
-    Resolves the calling account from the X-Account-Id header, which the
-    frontend sets to the id it got back from login/create_account.
+    Resolves the calling account from the VERIFIED Firebase ID token in the
+    Authorization header. The uid inside the token is the Responders doc id.
 
-    Raises 401 if the header is missing, 404 if no account with that id
-    exists in either collection.
+    Raises 401 if the token is missing/invalid/expired (see security.py) and
+    403 if the login is valid but has no account profile (e.g. a citizen).
     """
-    if not x_account_id:
-        raise HTTPException(status_code=401, detail="Missing X-Account-Id header")
+    account_id = token["uid"]
 
     db = get_db()
-    snapshot = db.collection(RESPONDERS).document(x_account_id).get()
+    snapshot = db.collection(RESPONDERS).document(account_id).get()
     if not snapshot.exists:
-        raise HTTPException(status_code=404, detail="Account not found")
+        raise HTTPException(status_code=403, detail="No account profile for this login")
 
     data = snapshot.to_dict() or {}
     return {
-        "id": x_account_id,
+        "id": account_id,
         "collection": RESPONDERS,
         "role": data.get("role") or data.get("position") or "Responder",
         "status": data.get("status"),
@@ -112,7 +112,7 @@ NO_STATION_SCOPE = "__no_station_assigned__"
 def get_station_scope(account: dict = Depends(get_current_account)) -> str:
     """
     Which station's data the caller may see, resolved server-side from the
-    X-Account-Id header (never from a client-supplied query param).
+    the verified token (never from a client-supplied query param).
 
       "ST002"         -> every account, super_admin included: only reports/units
                          routed to that station.
@@ -289,6 +289,23 @@ def require_page(page: str):
     return _check
 
 
+def _role_gate(*roles: str):
+    allowed = {r.lower() for r in roles}
+
+    def _check(account: dict = Depends(get_current_account)) -> dict:
+        if str(account["role"]).strip().lower() not in allowed:
+            raise HTTPException(status_code=403, detail="Not allowed.")
+        return account
+
+    return _check
+
+
+# For routers outside this file: Depends(admin_only) = super_admin or
+# responder_admin; Depends(super_admin_only) = super_admin.
+admin_only = _role_gate(*ADMIN_LEVEL_ROLES)
+super_admin_only = _role_gate(*FULL_ACCESS_ROLES)
+
+
 # ---------------------------------------------------------------------------
 # Collection
 #
@@ -319,7 +336,6 @@ except ImportError:  # pragma: no cover - firebase_admin should already be a
 
 
 class AccountCreate(BaseModel):
-    id: str | None = None  # if provided, reuses this doc id (e.g. a Firebase Auth UID from /auth/signup) instead of generating a new one — see create_account() below
     firstName: str = ""
     lastName: str = ""
     badge: str = ""
@@ -421,11 +437,11 @@ def _serialize(doc_id: str, data: dict) -> dict:
     return account
 
 
-def _require_super_admin_caller(db, x_account_id: str | None) -> None:
+def _require_super_admin_caller(db, account_id: str | None) -> None:
     """Granting the super_admin role is itself restricted to a super_admin."""
-    if not x_account_id:
-        raise HTTPException(status_code=401, detail="Missing X-Account-Id header")
-    snapshot = db.collection(RESPONDERS).document(x_account_id).get()
+    if not account_id:
+        raise HTTPException(status_code=401, detail="Login required.")
+    snapshot = db.collection(RESPONDERS).document(account_id).get()
     caller = snapshot.to_dict() or {} if snapshot.exists else {}
     caller_role = (caller.get("role") or caller.get("position") or "").strip().lower()
     if caller_role not in FULL_ACCESS_ROLES:
@@ -436,25 +452,35 @@ def _role_of(data: dict) -> str:
     return (data.get("role") or data.get("position") or "").strip().lower()
 
 
-def _get_caller(db, x_account_id: str | None) -> dict | None:
-    """Caller resolved from X-Account-Id, or None if missing / unknown."""
-    if not x_account_id:
+def _get_caller(db, account_id: str | None) -> dict | None:
+    """Caller resolved from the verified account id, or None if unknown."""
+    if not account_id:
         return None
-    snapshot = db.collection(RESPONDERS).document(x_account_id).get()
+    snapshot = db.collection(RESPONDERS).document(account_id).get()
     if not snapshot.exists:
         return None
     data = snapshot.to_dict() or {}
     return {
-        "id": x_account_id,
+        "id": account_id,
         "role": _role_of(data),
         "stationId": str(data.get("stationId") or "").strip(),
     }
 
 
-def _require_super_admin(db, x_account_id: str | None, action: str) -> dict:
-    caller = _get_caller(db, x_account_id)
+def _require_admin_caller(db, account_id: str | None) -> dict:
+    """Login required: caller must exist and be a super_admin or responder_admin."""
+    caller = _get_caller(db, account_id)
     if caller is None:
-        raise HTTPException(status_code=401, detail="Missing or unknown X-Account-Id header")
+        raise HTTPException(status_code=401, detail="Login required.")
+    if caller["role"] not in ADMIN_LEVEL_ROLES:
+        raise HTTPException(status_code=403, detail="Not allowed.")
+    return caller
+
+
+def _require_super_admin(db, account_id: str | None, action: str) -> dict:
+    caller = _get_caller(db, account_id)
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Login required.")
     if caller["role"] not in FULL_ACCESS_ROLES:
         raise HTTPException(status_code=403, detail=f"Only a Super Admin can {action}.")
     return caller
@@ -496,8 +522,8 @@ def _find_account(db, account_id: str):
 @router.get("/me")
 def get_me(account: dict = Depends(get_current_account)):
     """
-    Full profile for the logged-in caller, resolved from the X-Account-Id
-    header. Frontend calls this right after login to know who it's talking to.
+    Full profile for the logged-in caller, resolved from the verified
+    Bearer token. Frontend calls this right after login to know who it's talking to.
     """
     db = get_db()
     ref = db.collection(RESPONDERS).document(account["id"])
@@ -529,7 +555,7 @@ def list_accounts(
     duty: str | None = None,
     status: str | None = None,
     role: str | None = None,
-    x_account_id: str = Header(None, alias="X-Account-Id"),
+    account: dict = Depends(get_current_account),
 ):
     """
     Frontend accounts page: the full roster (super_admin, responder_admin,
@@ -549,7 +575,7 @@ def list_accounts(
 
     # A station admin only gets responders from their own station — never
     # Admin / Super Admin accounts and never other stations.
-    caller = _get_caller(db, x_account_id)
+    caller = _require_admin_caller(db, account["id"])
     station_admin_scope = caller["stationId"] if caller and caller["role"] == "responder_admin" else None
     scope_active = caller is not None and caller["role"] == "responder_admin"
 
@@ -593,71 +619,112 @@ def list_accounts(
 
 
 @router.post("", status_code=201)
-def create_account(payload: AccountCreate, x_account_id: str = Header(None, alias="X-Account-Id")):
+def create_account(payload: AccountCreate, account: dict = Depends(get_current_account)):
     """
     Creates a plain responder, a responder_admin ("Admin" in the Accounts page
     dropdown; the stored role string is still "responder_admin"), or a
     super_admin ("Super Admin" in the dropdown; only a super_admin may do this).
+
+    This is the ONLY place accounts are created. It makes the Firebase login
+    (email + the default temporary password) AND the Responders profile in one
+    request, so there is no public signup endpoint any more. New accounts are
+    always flagged is_new so the person must change the default password.
     """
     requested_role = (payload.role or "Responder").strip()
+    if requested_role.lower() not in ALLOWED_NEW_ACCOUNT_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid role.")
 
     db = get_db()
     # Adding accounts is a Super Admin action. Station admins can only manage
     # existing accounts (see update_account).
-    caller = _require_super_admin(db, x_account_id, "create accounts")
+    caller = _require_super_admin(db, account["id"], "create accounts")
     _assert_may_assign_in_own_station(
         caller,
         payload.stationId,
         role_change=requested_role.lower() != "responder",
         unit_change=bool(payload.unitId),
     )
+    if requested_role.lower() == "super_admin":
+        # Same rule update_account applies when granting the role.
+        _require_super_admin_caller(db, account["id"])
 
-    # If this account was created via /auth/signup first (the normal flow from
-    # the Accounts page — see accounts.js), payload.id is that Firebase Auth
-    # UID, and signup() has already written a doc under it (with an older,
-    # different field shape). Reusing that same id here means the write below
-    # correctly fills in the real profile schema, rather than creating a
-    # second, disconnected record that isn't tied to any login credential.
-    account_id = payload.id or str(uuid4())
+    if firebase_auth is None:
+        raise HTTPException(status_code=500, detail="firebase_admin auth is not available")
+
+    first_name = (payload.firstName or "").strip()
+    last_name = (payload.lastName or "").strip()
+    email = (payload.email or "").strip()
+    if not first_name or not last_name:
+        raise HTTPException(status_code=400, detail="First and last name are required.")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required.")
+
+    # Same username rule the Accounts page has always used (first.last, lower-case,
+    # no spaces); login-by-username depends on this field being present.
+    username = re.sub(r"\s+", "", f"{first_name}.{last_name}".lower())
+
+    users = db.collection(RESPONDERS)
+    if list(users.where("username", "==", username).limit(1).stream()):
+        raise HTTPException(status_code=400, detail="Username already exists.")
+    if list(users.where("email", "==", email).limit(1).stream()):
+        raise HTTPException(status_code=400, detail="Email already registered.")
+
+    try:
+        user_record = firebase_auth.create_user(email=email, password=DEFAULT_RESPONDER_PASSWORD)
+    except firebase_auth.EmailAlreadyExistsError:
+        raise HTTPException(status_code=400, detail="Email already registered.")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid email address.")
+    except Exception as err:
+        print(f"[accounts.create_account] Firebase create_user failed: {err}")
+        raise HTTPException(status_code=502, detail="Could not create the login for this account.")
+    account_id = user_record.uid
 
     has_duty = _has_duty(requested_role)
 
     account_data = {
-        "firstName": payload.firstName,
-        "lastName": payload.lastName,
+        "firstName": first_name,
+        "lastName": last_name,
         "badge": payload.badge,
-        "email": payload.email,
+        "email": email,
         "role": requested_role,
         "stationId": payload.stationId,
         "status": _normalize_status(payload.status),
         "unitId": payload.unitId,
-        "is_new": payload.is_new,
+        "is_new": True,  # always: the account starts on the default password
     }
 
     if has_duty:
         account_data["duty"] = _normalize_duty(payload.duty)
         account_data["dutyChangedAt"] = datetime.now(timezone.utc)
 
-    # merge=True (not a plain .set()) so this doesn't wipe out the "username"
-    # field that /auth/signup already wrote for this same doc — login-by-
-    # username depends on that field still being present.
-    db.collection(RESPONDERS).document(account_id).set({
-        **account_data,
-        "createdAt": datetime.now(timezone.utc),
-    }, merge=True)
+    try:
+        users.document(account_id).set({
+            **account_data,
+            "username": username,
+            "createdAt": datetime.now(timezone.utc),
+        })
+    except Exception as err:
+        # Don't leave a login behind that has no profile.
+        print(f"[accounts.create_account] Firestore write failed for {account_id}: {err}")
+        try:
+            firebase_auth.delete_user(account_id)
+        except Exception as cleanup_err:
+            print(f"[accounts.create_account] Could not remove orphan login {account_id}: {cleanup_err}")
+        raise HTTPException(status_code=503, detail="Could not save the account. Nothing was created.")
 
     return {"id": account_id, "collection": RESPONDERS, **account_data}
 
 
 @router.patch("/{account_id}")
-def update_account(account_id: str, payload: AccountUpdate, x_account_id: str = Header(None, alias="X-Account-Id")):
+def update_account(account_id: str, payload: AccountUpdate, account: dict = Depends(get_current_account)):
     db = get_db()
     ref, snapshot = _find_account(db, account_id)
     existing = snapshot.to_dict() or {}
 
     data = payload.model_dump(exclude_unset=True)
 
-    caller = _get_caller(db, x_account_id)
+    caller = _require_admin_caller(db, account["id"])
     if caller and caller["role"] == "responder_admin":
         if caller["id"] == account_id:
             # Editing yourself (e.g. clearing is_new after a password change) is
@@ -690,7 +757,7 @@ def update_account(account_id: str, payload: AccountUpdate, x_account_id: str = 
         (data["role"] or "").strip().lower() == "super_admin"
         or (existing_role == "super_admin" and (data["role"] or "").strip().lower() != "super_admin")
     ):
-        _require_super_admin_caller(db, x_account_id)
+        _require_super_admin_caller(db, account["id"])
 
     # Normalize before writing so an admin UI sending "On Duty" or a mobile
     # client sending "on" can't put an unrecognized string into Firestore.
@@ -726,7 +793,7 @@ def update_account(account_id: str, payload: AccountUpdate, x_account_id: str = 
 
 
 @router.patch("/{account_id}/duty")
-def set_duty(account_id: str, payload: DutyUpdate):
+def set_duty(account_id: str, payload: DutyUpdate, account: dict = Depends(get_current_account)):
     """
     Shift toggle. Send {"duty": "on_duty"} / {"duty": "off_duty"} to set an
     explicit state, or an empty body to flip whatever is currently stored.
@@ -737,6 +804,13 @@ def set_duty(account_id: str, payload: DutyUpdate):
     db = get_db()
     ref, snapshot = _find_account(db, account_id)
     existing_role = (snapshot.to_dict() or {}).get("role")
+
+    # Only the account itself, or an admin of the same station, may change a duty state.
+    if account["id"] != account_id:
+        caller = _require_admin_caller(db, account["id"])
+        target_station = str((snapshot.to_dict() or {}).get("stationId") or "").strip()
+        if not caller["stationId"] or caller["stationId"] != target_station:
+            raise HTTPException(status_code=403, detail="You can only change duty for accounts in your own station.")
 
     if not _has_duty(existing_role):
         raise HTTPException(status_code=409, detail="Only responders have a duty state")
@@ -769,7 +843,7 @@ def set_duty(account_id: str, payload: DutyUpdate):
 
 
 @router.patch("/{account_id}/status")
-def set_status(account_id: str, payload: AccountUpdate, x_account_id: str = Header(None, alias="X-Account-Id")):
+def set_status(account_id: str, payload: AccountUpdate, account: dict = Depends(get_current_account)):
     """
     Set account status. Send {"status": "on"}, {"status": "off"}, or
     {"status": "inactive"} — same values the Accounts admin UI has always
@@ -785,7 +859,7 @@ def set_status(account_id: str, payload: AccountUpdate, x_account_id: str = Head
     ref, snapshot = _find_account(db, account_id)
     existing = snapshot.to_dict() or {}
 
-    caller = _get_caller(db, x_account_id)
+    caller = _require_admin_caller(db, account["id"])
     if caller and caller["role"] == "responder_admin":
         if caller["id"] == account_id:
             raise HTTPException(status_code=403, detail="You cannot change your own status.")
@@ -805,7 +879,7 @@ def set_status(account_id: str, payload: AccountUpdate, x_account_id: str = Head
 
 
 @router.post("/{account_id}/reset-password")
-def reset_password(account_id: str, x_account_id: str = Header(None, alias="X-Account-Id")):
+def reset_password(account_id: str, account: dict = Depends(get_current_account)):
     """
     Resets an account's login password back to the same default new accounts
     get (see DEFAULT_RESPONDER_PASSWORD) and re-arms is_new so they're forced
@@ -818,7 +892,7 @@ def reset_password(account_id: str, x_account_id: str = Header(None, alias="X-Ac
         raise HTTPException(status_code=500, detail="firebase_admin auth is not available")
 
     db = get_db()
-    _require_super_admin(db, x_account_id, "reset passwords")
+    _require_super_admin(db, account["id"], "reset passwords")
     ref, _ = _find_account(db, account_id)
 
     try:
@@ -835,9 +909,9 @@ def reset_password(account_id: str, x_account_id: str = Header(None, alias="X-Ac
 
 
 @router.delete("/{account_id}")
-def delete_account(account_id: str, x_account_id: str = Header(None, alias="X-Account-Id")):
+def delete_account(account_id: str, account: dict = Depends(get_current_account)):
     db = get_db()
-    _require_super_admin(db, x_account_id, "revoke accounts")
+    _require_super_admin(db, account["id"], "revoke accounts")
     ref, _ = _find_account(db, account_id)
     ref.delete()
 

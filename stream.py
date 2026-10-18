@@ -24,7 +24,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from agora_token_builder import RtcTokenBuilder
 
-from accounts import get_station_scope, route_unassigned
+from accounts import get_station_scope, require_page, route_unassigned
+from security import get_verified_token
 from config import AGORA_APP_ID, AGORA_APP_CERTIFICATE
 from firebase import get_db
 
@@ -176,7 +177,11 @@ async def live_updates(station_id: str = Depends(get_station_scope)):
 # ── Create Stream ─────────────────────────────────────────────────────────────
 
 @router.post("/create/{emergency_id}")
-def create_stream(emergency_id: str):
+def create_stream(
+    emergency_id: str,
+    station_id: str = Depends(get_station_scope),
+    _: dict = Depends(require_page("dashboard")),
+):
     """Creates a unique stream channel for an active call."""
     db = get_db()
     ref = db.collection("ActiveCalls").document(emergency_id)
@@ -186,6 +191,9 @@ def create_stream(emergency_id: str):
         raise HTTPException(status_code=404, detail="Active call not found")
 
     data = doc.to_dict()
+    assigned = data.get("assignedStation") or {}
+    if str(data.get("nearestStationId") or assigned.get("stationId") or "").strip() != station_id:
+        raise HTTPException(status_code=404, detail="Active call not found")
     channel_id = data.get("streamChannelId") or f"livealert-{uuid.uuid4().hex[:10]}"
     ref.update({"streamChannelId": channel_id})
 
@@ -201,7 +209,7 @@ def create_stream(emergency_id: str):
 # ── Get Token ─────────────────────────────────────────────────────────────────
 
 @router.get("/token/{channel_id}")
-def get_stream_token(channel_id: str):
+def get_stream_token(channel_id: str, _: dict = Depends(get_verified_token)):
     """Get a dynamic token for joining an Agora channel."""
     try:
         token = _generate_agora_token(channel_id)
@@ -266,7 +274,13 @@ def join_stream(channel_id: str):
       status("Accessing camera and microphone...");
       
       try {{
-        const tokenRes = await fetch(`/api/v1/stream/token/${{channelName}}`);
+        // The login token arrives in the URL fragment (#token=...), which the
+        // browser never sends to the server. Read it, then wipe it from the address bar.
+        const authToken = new URLSearchParams(location.hash.slice(1)).get("token");
+        history.replaceState(null, "", location.pathname + location.search);
+        const tokenRes = await fetch(`/api/v1/stream/token/${{channelName}}`, {{
+          headers: authToken ? {{ Authorization: `Bearer ${{authToken}}` }} : {{}},
+        }});
         if (!tokenRes.ok) throw new Error("Failed to get token");
         const tokenData = await tokenRes.json();
         const token = tokenData.token;
@@ -341,7 +355,13 @@ def view_stream(channel_id: str):
       }}
 
       try {{
-        const tokenRes = await fetch(`/api/v1/stream/token/${{channelName}}`);
+        // The login token arrives in the URL fragment (#token=...), which the
+        // browser never sends to the server. Read it, then wipe it from the address bar.
+        const authToken = new URLSearchParams(location.hash.slice(1)).get("token");
+        history.replaceState(null, "", location.pathname + location.search);
+        const tokenRes = await fetch(`/api/v1/stream/token/${{channelName}}`, {{
+          headers: authToken ? {{ Authorization: `Bearer ${{authToken}}` }} : {{}},
+        }});
         if (!tokenRes.ok) throw new Error("Failed to get token");
         const tokenData = await tokenRes.json();
         const token = tokenData.token;

@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 from math import radians, sin, cos, sqrt, atan2
-from accounts import get_station_scope, route_unassigned
+from accounts import get_station_scope, require_page, route_unassigned
 from firebase import get_db
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
@@ -515,74 +515,19 @@ def get_recent(limit: int = 10, station_id: str | None = Depends(get_station_sco
 # which already read from ActiveCalls.
 
 
-@router.get("/accounts")
-def list_accounts():
-    """Frontend accounts page: operational unit roster."""
-    db = get_db()
-    docs = list(db.collection("Responders").stream())
-
-    accounts = []
-    for doc in docs:
-        data = doc.to_dict() or {}
-        status = data.get("status", "available")
-        if status in ("available", "active"):
-            normalized_status = "on"
-        elif status == "deployed":
-            normalized_status = "off"
-        else:
-            normalized_status = "inactive"
-
-        accounts.append({
-            "id": doc.id,
-            "name": data.get("name") or f"{data.get('firstName', '')} {data.get('lastName', '')}".strip() or "Unknown",
-            "role": data.get("role") or data.get("position") or "Firefighter",
-            "group": data.get("group") or data.get("station") or "Alpha 1",
-            "status": normalized_status,
-        })
-
-    return {"accounts": accounts[:20]}
-
-
-@router.post("/accounts", status_code=201)
-def create_account(payload: AccountCreate):
-    db = get_db()
-    account_id = str(uuid4())
-    account_data = {
-        "name": payload.name,
-        "role": payload.role,
-        "group": payload.group,
-        "status": payload.status,
-    }
-    db.collection("Responders").document(account_id).set(account_data)
-    return {"id": account_id, **account_data}
-
-
-@router.patch("/accounts/{account_id}")
-def update_account(account_id: str, payload: AccountUpdate):
-    db = get_db()
-    ref = db.collection("Responders").document(account_id)
-    if not ref.get().exists:
-        raise HTTPException(status_code=404, detail="Account not found")
-    data = payload.model_dump(exclude_unset=True)
-    if data:
-        ref.update(data)
-    return {"updated": True, "accountId": account_id}
-
-
-@router.delete("/accounts/{account_id}")
-def delete_account(account_id: str):
-    db = get_db()
-    ref = db.collection("Responders").document(account_id)
-    if not ref.get().exists:
-        raise HTTPException(status_code=404, detail="Account not found")
-    ref.delete()
-    return {"deleted": True, "accountId": account_id}
+# The unauthenticated /dashboard/accounts CRUD routes that used to live here were
+# removed: they duplicated accounts.py (with an older schema) and let anyone
+# create, edit or delete Responders. Use /api/v1/accounts instead.
 
 
 # ── Modify Nearest Station Modal ──────────────────────────────────────────────
 
 @router.get("/stations/{emergency_id}")
-def get_stations_for_emergency(emergency_id: str):
+def get_stations_for_emergency(
+    emergency_id: str,
+    station_id: str = Depends(get_station_scope),
+    _: dict = Depends(require_page("dashboard")),
+):
     """
     Returns all stations with their distance from the emergency location.
     Used to populate the 'Modify Nearest Station' modal map.
@@ -595,6 +540,8 @@ def get_stations_for_emergency(emergency_id: str):
         raise HTTPException(status_code=404, detail="Active call not found")
 
     data = doc.to_dict()
+    if not _matches_station(data, station_id):
+        raise HTTPException(status_code=404, detail="Active call not found")
     assigned_station = data.get("assignedStation") or {}
     current_nearest = data.get("nearestStationId") or assigned_station.get("stationId", "")
     emergency_location = data.get("location")
@@ -654,7 +601,12 @@ class UpdateNearestStation(BaseModel):
 
 
 @router.patch("/stations/{emergency_id}")
-def update_nearest_station(emergency_id: str, body: UpdateNearestStation):
+def update_nearest_station(
+    emergency_id: str,
+    body: UpdateNearestStation,
+    station_id: str = Depends(get_station_scope),
+    _: dict = Depends(require_page("dashboard")),
+):
     """
     Updates the nearest station for an active call.
     Called when user confirms a new station in the modal.
@@ -663,7 +615,7 @@ def update_nearest_station(emergency_id: str, body: UpdateNearestStation):
 
     ref = db.collection("ActiveCalls").document(emergency_id)
     doc = ref.get()
-    if not doc.exists:
+    if not doc.exists or not _matches_station(doc.to_dict() or {}, station_id):
         raise HTTPException(status_code=404, detail="Active call not found")
 
     # Verify the station exists

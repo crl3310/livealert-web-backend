@@ -28,23 +28,36 @@ from maps_config import router as maps_config_router
 from duty import router as duty_router
 
 
-app = FastAPI(title="LiveAlert API", version="1.0.0")
+IS_PROD = os.getenv("ENVIRONMENT") == "production"
+
+app = FastAPI(
+    title="LiveAlert API",
+    version="1.0.0",
+    docs_url=None if IS_PROD else "/docs",
+    redoc_url=None if IS_PROD else "/redoc",
+    openapi_url=None if IS_PROD else "/openapi.json",
+)
 
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    print(f"Incoming request: {request.method} {request.url}")
+    print(f"Incoming request: {request.method} {request.url.path}")
     try:
         response = await call_next(request)
     except Exception as exc:
-        print(f"Request error: {request.method} {request.url} -> {exc}")
+        print(f"Request error: {request.method} {request.url.path} -> {exc}")
         raise
-    print(f"Response status: {request.method} {request.url} -> {response.status_code}")
+    print(f"Response status: {request.method} {request.url.path} -> {response.status_code}")
     return response
+
+ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
+
+# Uncomment while developing locally:
+#ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

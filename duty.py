@@ -1,9 +1,10 @@
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from accounts import get_current_account
 from firebase import get_db
 
 router = APIRouter(prefix="/duty", tags=["Duty"])
@@ -17,12 +18,10 @@ class DutyUpdate(BaseModel):
     duty: Literal["on_duty", "off_duty"]
 
 
-def _responder_ref(account_id: str | None):
-    # Same identity the rest of the site uses: the doc id sent as X-Account-Id.
-    # If accounts.py has a get_current_account() dependency, swap it in here.
-    if not account_id or not account_id.strip():
-        raise HTTPException(status_code=401, detail="Missing X-Account-Id")
-    return get_db().collection(RESPONDERS).document(account_id.strip())
+def _responder_ref(account: dict):
+    # The caller is the verified account from the Bearer token, so a client
+    # can no longer read or change someone else's duty by sending their id.
+    return get_db().collection(RESPONDERS).document(account["id"])
 
 
 def _payload(data: dict) -> dict:
@@ -38,8 +37,8 @@ def _payload(data: dict) -> dict:
 
 
 @router.get("/me")
-def get_my_duty(x_account_id: str | None = Header(default=None, alias="X-Account-Id")):
-    snap = _responder_ref(x_account_id).get()
+def get_my_duty(account: dict = Depends(get_current_account)):
+    snap = _responder_ref(account).get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Account not found")
     return _payload(snap.to_dict() or {})
@@ -48,9 +47,9 @@ def get_my_duty(x_account_id: str | None = Header(default=None, alias="X-Account
 @router.patch("/me")
 def set_my_duty(
     body: DutyUpdate,
-    x_account_id: str | None = Header(default=None, alias="X-Account-Id"),
+    account: dict = Depends(get_current_account),
 ):
-    ref = _responder_ref(x_account_id)
+    ref = _responder_ref(account)
     snap = ref.get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Account not found")

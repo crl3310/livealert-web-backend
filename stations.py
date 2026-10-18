@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from accounts import admin_only, super_admin_only
 from firebase import get_db
 
 try:
@@ -62,7 +63,7 @@ def _serialize_station(doc) -> dict:
     }
 
 
-@router.get("")
+@router.get("", dependencies=[Depends(admin_only)])
 def list_stations():
     """Frontend accounts page: station registry for dropdowns/filters."""
     db = get_db()
@@ -71,7 +72,7 @@ def list_stations():
     return {"stations": stations}
 
 
-@router.post("", status_code=201)
+@router.post("", status_code=201, dependencies=[Depends(super_admin_only)])
 def create_station(payload: StationCreate):
     db = get_db()
     station_id = _next_station_id(db)
@@ -90,7 +91,7 @@ def create_station(payload: StationCreate):
     }
 
 
-@router.patch("/{station_id}")
+@router.patch("/{station_id}", dependencies=[Depends(super_admin_only)])
 def update_station(station_id: str, payload: StationUpdate):
     db = get_db()
     station_ref = db.collection("Stations").document(station_id)
@@ -111,7 +112,7 @@ def update_station(station_id: str, payload: StationUpdate):
     return {"updated": True, "stationId": station_id}
 
 
-@router.delete("/{station_id}")
+@router.delete("/{station_id}", dependencies=[Depends(super_admin_only)])
 def delete_station(station_id: str):
     db = get_db()
     station_ref = db.collection("Stations").document(station_id)

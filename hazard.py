@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
-from accounts import get_station_scope
+from accounts import get_current_account, get_station_scope
 from firebase import get_db
 
 router = APIRouter(prefix="/hazards", tags=["Hazards"])
@@ -289,6 +289,7 @@ def resolve_hazard(
     resolution_notes: str = Form(""),
     evidence: list[UploadFile] = File(default=[]),
     station_id: str | None = Depends(get_station_scope),
+    account: dict = Depends(get_current_account),
 ):
     """
     Marks a hazard as resolved. Only hazards inside the caller's station scope can be resolved.
@@ -328,7 +329,7 @@ def resolve_hazard(
                         "outcomeLabel": RESOLUTION_OUTCOMES[outcome_key],
                         "hazardDetails": details,
                         "resolutionNotes": notes,
-                        "resolvedBy": (request.headers.get("X-Account-Id") or "").strip(),
+                        "resolvedBy": account["id"],
                         "evidence": stored,
                     },
                 })

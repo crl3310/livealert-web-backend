@@ -4,7 +4,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from accounts import get_station_scope, route_unassigned
+from accounts import get_station_scope, require_page, route_unassigned
 from firebase import get_db
 from history import _bucket_video_urls, _remarks_out, _video_urls
 from units import _on_duty_responders
@@ -299,7 +299,12 @@ def get_report_detail(report_id: str, station_id: str | None = Depends(get_stati
 
 
 @router.patch("/{report_id}")
-def update_report(report_id: str, payload: ReportUpdate):
+def update_report(
+    report_id: str,
+    payload: ReportUpdate,
+    station_id: str | None = Depends(get_station_scope),
+    _: dict = Depends(require_page("report")),
+):
     db = get_db()
     ref = db.collection("ActiveCalls").document(report_id)
     doc = ref.get()
@@ -308,6 +313,8 @@ def update_report(report_id: str, payload: ReportUpdate):
 
     data = payload.model_dump(exclude_unset=True)
     existing_data = doc.to_dict() or {}
+    if not _matches_station(existing_data, station_id):
+        raise HTTPException(status_code=404, detail="Report not found")
 
     # Stamp when a report actually ended, server-side, the first time status
     # crosses into ENDED_STATUSES (e.g. via the "End Dispatch" button) — never

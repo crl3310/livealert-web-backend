@@ -10,6 +10,7 @@ import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -161,22 +162,6 @@ DEFAULT_RESPONDER_PASSWORD = "default123"
 class LoginRequest(BaseModel):
     usernameOrEmail: str
     password: str
-
-
-class SignupRequest(BaseModel):
-    username: str
-    email: str
-    password: str | None = None  # omitted by the Accounts page -> DEFAULT_RESPONDER_PASSWORD is used
-    role: str | None = None      # explicit role for this account. Only "super_admin"
-                                  # is accepted here (auth.html's "Create Admin Account"
-                                  # form); responder_admin is created via POST /accounts
-                                  # instead. Left unset both by mobile self-signup (falls
-                                  # through to _create_responder_for_user below, default
-                                  # plain "Responder" role) and by accounts.js's officer-
-                                  # creation flow, which calls this endpoint first with no
-                                  # role and then POST /accounts right after with the real
-                                  # one — that second call is what actually places the
-                                  # account, so the default bootstrap here is fine either way.
 
 
 class ChangePasswordRequest(BaseModel):
@@ -352,96 +337,6 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
     }
 
 
-@router.post("/signup", status_code=201)
-async def signup(request: Request, payload: SignupRequest | None = Body(default=None)):
-    """Register a new user and store a lightweight user profile."""
-    if payload is None:
-        try:
-            raw = await request.body()
-            data = json.loads(raw.decode("utf-8")) if raw else {}
-        except Exception:
-            raise HTTPException(status_code=400, detail="Request body must be valid JSON")
-        payload = SignupRequest(**data)
-
-    try:
-        username_taken = _find_user_by_username_or_email(payload.username) is not None
-        email_taken = _find_user_by_username_or_email(payload.email) is not None
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _raise_firestore_unavailable(exc)
-    if username_taken:
-        raise HTTPException(status_code=400, detail="Username already exists.")
-    if email_taken:
-        raise HTTPException(status_code=400, detail="Email already registered.")
-
-    account_password = payload.password or DEFAULT_RESPONDER_PASSWORD
-
-    auth_data = _firebase_auth_request("signUp", {
-        "email": payload.email,
-        "password": account_password,
-        "returnSecureToken": True,
-    })
-
-    user_id = auth_data.get("localId")
-    if user_id:
-        try:
-            db = get_db()
-            requested_role = (payload.role or "").strip()
-            if requested_role and requested_role.lower() == "responder_admin":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Admin accounts are created via POST /accounts, not /auth/signup.",
-                )
-
-            if requested_role:
-                display_name = payload.username or payload.email.split("@")[0]
-                first_name, _, last_name = display_name.partition(".")
-
-                db.collection("Responders").document(user_id).set({
-                    "username": payload.username,
-                    "firstName": first_name or display_name,
-                    "lastName": last_name,
-                    "email": payload.email,
-                    "badge": "",
-                    "role": requested_role,
-                    "stationId": "",
-                    "unitId": "",
-                    "status": "on",
-                    "is_new": False,  # they just set their own password during signup
-                    "createdAt": datetime.now(timezone.utc),
-                })
-            else:
-                # No collection split anymore, so there's no need for the
-                # old "write a lightweight Users doc, then separately
-                # bootstrap a Responders doc" two-step — one write does it.
-                _create_responder_for_user(user_id, payload.username, payload.email)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            # The Firebase Auth account already exists at this point, so
-            # claiming registration failed outright would be misleading —
-            # retrying would just 400 on "already exists" above. Surface a
-            # clear, actionable 503 instead of a raw 500 or a false "success"
-            # with no profile doc behind it.
-            print(f"[auth.signup] Firestore profile write failed for {user_id}: {exc}")
-            raise HTTPException(
-                status_code=503,
-                detail="Your login was created, but saving your profile failed. Please contact support before signing in.",
-            ) from exc
-
-    return {
-        "status": "success",
-        "message": "Registration successful.",
-        "user": {
-            "id": auth_data.get("localId"),
-            "email": auth_data.get("email"),
-        },
-        "token": auth_data.get("idToken"),
-        "refreshToken": auth_data.get("refreshToken"),
-    }
-
-
 @router.post("/change-password")
 async def change_password(payload: ChangePasswordRequest):
     """
@@ -505,6 +400,44 @@ async def change_password(payload: ChangePasswordRequest):
         "message": "Password updated.",
         "token": auth_data.get("idToken"),
         "refreshToken": auth_data.get("refreshToken"),
+    }
+
+
+class RefreshRequest(BaseModel):
+    refreshToken: str
+
+
+@router.post("/refresh")
+def refresh_session(payload: RefreshRequest):
+    """
+    Swaps a refresh token for a fresh ID token. ID tokens only live for an
+    hour, so the website calls this in the background to keep people signed in.
+    Fails with 401 once the refresh token is no longer valid (password changed,
+    account disabled/deleted, or sessions revoked).
+    """
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": payload.refreshToken,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://securetoken.googleapis.com/v1/token?key={API_KEY}",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        print(f"[auth.refresh] Firebase rejected the refresh token (HTTP {exc.code})")
+        raise HTTPException(status_code=401, detail="Your session has ended. Please log in again.")
+    except Exception as exc:
+        print(f"[auth.refresh] {exc.__class__.__name__}: {exc}")
+        raise HTTPException(status_code=503, detail="Could not renew the session right now.")
+
+    return {
+        "status": "success",
+        "token": data.get("id_token"),
+        "refreshToken": data.get("refresh_token"),
     }
 
 
