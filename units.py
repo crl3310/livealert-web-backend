@@ -31,13 +31,55 @@ def _serialize_unit(doc) -> dict:
     }
 
 
+_DUTY_FIELDS = ("duty", "dutyStatus", "onDuty")
+_DUTY_ON_VALUES = {"on_duty", "on-duty", "on duty", "onduty", "on", "online", "true"}
+_ID_FIELDS = ("userId", "accountId", "uid", "responderId", "email")
+
+
+def _is_on_duty(data: dict) -> bool:
+    for key in _DUTY_FIELDS:
+        v = data.get(key)
+        if v is True or (isinstance(v, str) and v.strip().lower() in _DUTY_ON_VALUES):
+            return True
+    # "status" is also used for account state elsewhere, so only the explicit
+    # on-duty spellings count here (not "active"/"on").
+    status = data.get("status")
+    return isinstance(status, str) and status.strip().lower() in {"on_duty", "on-duty", "on duty"}
+
+
+# The responder docs (badge, duty, unitId, ...) may live in any of these
+# collections depending on how accounts are stored; empty/missing ones are
+# simply skipped.
+_RESPONDER_COLLECTIONS = ("Responders", "Accounts", "Users")
+
+
+def _on_duty_responders(db) -> list[dict]:
+    """On-duty responders, as small records the frontend can match on."""
+    out, seen = [], set()
+    for coll in _RESPONDER_COLLECTIONS:
+        for doc in db.collection(coll).stream():
+            if doc.id in seen:
+                continue
+            data = doc.to_dict() or {}
+            if not _is_on_duty(data):
+                continue
+            seen.add(doc.id)
+            out.append({
+                "id": doc.id,
+                "email": (data.get("email") or "").strip().lower(),
+                "unitId": data.get("unitId") or None,
+                "name": f"{data.get('firstName', '')} {data.get('lastName', '')}".strip().lower(),
+            })
+    return out
+
+
 @router.get("")
 def list_units():
     """Frontend units page: all units (callsigns/teams), client-filtered by stationId."""
     db = get_db()
     docs = list(db.collection("Units").stream())
     units = [_serialize_unit(doc) for doc in docs]
-    return {"units": units}
+    return {"units": units, "onDutyResponders": _on_duty_responders(db)}
 
 
 @router.post("", status_code=201)
@@ -78,20 +120,3 @@ def update_unit(unit_id: str, payload: UnitUpdate):
         ref.update(update_data)
 
     return {"updated": True, "unitId": unit_id}
-
-
-@router.delete("/{unit_id}")
-def delete_unit(unit_id: str):
-    db = get_db()
-    ref = db.collection("Units").document(unit_id)
-    if not ref.get().exists:
-        raise HTTPException(status_code=404, detail="Unit not found")
-
-    # Deleting a unit doesn't cascade to the Responders assigned to it —
-    # their unitId would just point at a doc that no longer exists. The
-    # frontend's Accounts/Units pages both look unit names up by id and
-    # already handle a miss by falling back to "Unassigned" labels, so this
-    # is a soft failure rather than a broken reference, but it's worth
-    # knowing about if a proper cascade-unassign is wanted later.
-    ref.delete()
-    return {"deleted": True, "unitId": unit_id}

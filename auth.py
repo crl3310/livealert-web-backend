@@ -6,8 +6,12 @@ Uses Firebase Identity Toolkit REST endpoints to sign users in and sign them up.
 """
 
 import json
+import os
+import threading
+import time
 import urllib.error
 import urllib.request
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +23,114 @@ from config import FIREBASE_AUTH_URL, API_KEY
 from firebase import get_db
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+
+
+# ---------------------------------------------------------------------------
+# Login brute-force protection
+#
+# Failed logins (wrong password / unknown user) are counted per ACCOUNT and per
+# client IP inside a sliding window. Hitting a limit locks that key out for
+# LOGIN_LOCKOUT_SEC and /auth/login answers 429 + Retry-After without even
+# contacting Firebase. A successful login clears the account's counter (never
+# the IP's, so someone with one valid account can't reset their own attack on
+# others). State is in memory: it resets on restart and isn't shared between
+# multiple worker processes (see notes if you ever run more than one).
+# ---------------------------------------------------------------------------
+LOGIN_MAX_FAILS_PER_ACCOUNT = 5     # wrong attempts allowed per account...
+LOGIN_MAX_FAILS_PER_IP = 20         # ...and per IP (higher: offices share one IP)
+LOGIN_WINDOW_SEC = 15 * 60          # failures older than this are forgotten
+LOGIN_LOCKOUT_SEC = 15 * 60         # how long a locked key stays blocked
+
+# Only set LOGIN_TRUST_PROXY=1 when the API sits behind a reverse proxy you
+# control (nginx, Cloudflare, ...). X-Forwarded-For is trivially spoofable
+# otherwise, which would let an attacker dodge the per-IP limit.
+TRUST_PROXY_HEADERS = os.getenv("LOGIN_TRUST_PROXY", "0").lower() in {"1", "true", "yes", "on"}
+
+# Firebase error codes that mean "these credentials are wrong".
+_BAD_CREDENTIAL_CODES = ("INVALID_PASSWORD", "EMAIL_NOT_FOUND", "INVALID_LOGIN_CREDENTIALS")
+
+
+class _LoginLimiter:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._fails: dict[str, deque] = defaultdict(deque)  # key -> failure timestamps
+        self._locked_until: dict[str, float] = {}            # key -> unix time
+
+    def retry_after(self, key: str) -> int:
+        """Seconds until `key` may try again (0 = not locked)."""
+        now = time.time()
+        with self._lock:
+            until = self._locked_until.get(key, 0.0)
+            if until > now:
+                return int(until - now) + 1
+            self._locked_until.pop(key, None)
+            return 0
+
+    def record_failure(self, key: str, limit: int) -> None:
+        now = time.time()
+        with self._lock:
+            if len(self._fails) > 5000:
+                self._purge(now)
+            q = self._fails[key]
+            while q and now - q[0] > LOGIN_WINDOW_SEC:
+                q.popleft()
+            q.append(now)
+            if len(q) >= limit:
+                self._locked_until[key] = now + LOGIN_LOCKOUT_SEC
+                q.clear()
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._fails.pop(key, None)
+            self._locked_until.pop(key, None)
+
+    def _purge(self, now: float) -> None:
+        """Drop expired entries so random-username spam can't grow memory forever."""
+        for k in [k for k, q in self._fails.items() if not q or now - q[-1] > LOGIN_WINDOW_SEC]:
+            self._fails.pop(k, None)
+        for k in [k for k, t in self._locked_until.items() if t <= now]:
+            self._locked_until.pop(k, None)
+
+
+_login_limiter = _LoginLimiter()
+
+
+def _client_ip(request: Request) -> str:
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _login_limit_keys(request: Request, identifier: str) -> list[tuple[str, int]]:
+    return [
+        (f"ip:{_client_ip(request)}", LOGIN_MAX_FAILS_PER_IP),
+        (f"acct:{identifier.strip().lower()}", LOGIN_MAX_FAILS_PER_ACCOUNT),
+    ]
+
+
+def _enforce_login_limits(keys: list[tuple[str, int]]) -> None:
+    """Raise 429 if any of these keys is currently locked out."""
+    wait = max((_login_limiter.retry_after(k) for k, _ in keys), default=0)
+    if wait > 0:
+        minutes = (wait + 59) // 60
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed login attempts. Try again in {minutes} minute{'s' if minutes != 1 else ''}.",
+            headers={"Retry-After": str(wait)},
+        )
+
+
+def _record_login_failure(keys: list[tuple[str, int]]) -> None:
+    for key, limit in keys:
+        _login_limiter.record_failure(key, limit)
+
+
+def _reset_login_failures(keys: list[tuple[str, int]]) -> None:
+    for key, _ in keys:
+        if key.startswith("acct:"):  # never reset the IP counter on success
+            _login_limiter.reset(key)
 
 
 def _raise_firestore_unavailable(exc: Exception) -> None:
@@ -150,6 +262,11 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
             raise HTTPException(status_code=400, detail="Request body must be valid JSON")
         payload = LoginRequest(**data)
 
+    # Brute-force protection: refuse before doing any work if this IP or
+    # account is locked out.
+    limit_keys = _login_limit_keys(request, payload.usernameOrEmail)
+    _enforce_login_limits(limit_keys)
+
     email = payload.usernameOrEmail
     if "@" not in email:
         try:
@@ -159,14 +276,37 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
         except Exception as exc:
             _raise_firestore_unavailable(exc)
         if user is None or "email" not in user:
+            _record_login_failure(limit_keys)
             raise HTTPException(status_code=404, detail="User not found.")
         email = user["email"]
 
-    auth_data = _firebase_auth_request("signInWithPassword", {
-        "email": email,
-        "password": payload.password,
-        "returnSecureToken": True,
-    })
+        # Also track by the resolved email, so alternating between username
+        # and email for the same account can't dodge the counter.
+        email_key = (f"acct:{email.strip().lower()}", LOGIN_MAX_FAILS_PER_ACCOUNT)
+        if email_key not in limit_keys:
+            limit_keys.append(email_key)
+            _enforce_login_limits([email_key])
+
+    try:
+        auth_data = _firebase_auth_request("signInWithPassword", {
+            "email": email,
+            "password": payload.password,
+            "returnSecureToken": True,
+        })
+    except HTTPException as exc:
+        detail = str(exc.detail)
+        if detail.startswith(_BAD_CREDENTIAL_CODES):
+            _record_login_failure(limit_keys)
+        elif detail.startswith("TOO_MANY_ATTEMPTS_TRY_LATER"):
+            # Firebase's own throttle kicked in; pass that on as a proper 429.
+            raise HTTPException(
+                status_code=429,
+                detail="Too many attempts. Please try again later.",
+                headers={"Retry-After": "60"},
+            ) from exc
+        raise
+
+    _reset_login_failures(limit_keys)
 
     auth_user_id = auth_data.get("localId")
     is_new = False
@@ -248,13 +388,6 @@ async def signup(request: Request, payload: SignupRequest | None = Body(default=
         try:
             db = get_db()
             requested_role = (payload.role or "").strip()
-
-            # responder_admin ("Admin" in the Accounts page dropdown) is
-            # created via POST /accounts, not here — this endpoint only
-            # handles the two paths that existed before that role did: a
-            # blank role (mobile self-signup -> plain responder, below) and
-            # an explicit "super_admin" (auth.html's "Create Admin Account"
-            # form).
             if requested_role and requested_role.lower() == "responder_admin":
                 raise HTTPException(
                     status_code=400,
@@ -262,16 +395,6 @@ async def signup(request: Request, payload: SignupRequest | None = Body(default=
                 )
 
             if requested_role:
-                # The caller already knows the final role — e.g. auth.html's
-                # "Create Admin Account" form sends role="super_admin" — so
-                # write the full account record straight into Responders,
-                # the single collection every account now lives in. This
-                # replaces the old two-step dance where signup() always
-                # bootstrapped a default Responder doc and the frontend then
-                # had to PATCH /accounts/{id} afterward to relabel it; if
-                # that second call failed, the account was left sitting
-                # unlabeled and restricted, with no visible sign anything
-                # was wrong besides a console warning.
                 display_name = payload.username or payload.email.split("@")[0]
                 first_name, _, last_name = display_name.partition(".")
 
@@ -332,11 +455,6 @@ async def change_password(payload: ChangePasswordRequest):
     if payload.newPassword == DEFAULT_RESPONDER_PASSWORD:
         raise HTTPException(status_code=400, detail="Choose a password other than the default one.")
 
-    # Firebase only accepts a password change from a *recent* sign-in and
-    # otherwise answers CREDENTIAL_TOO_OLD_LOGIN_AGAIN. This screen is only
-    # reachable while the account is still on DEFAULT_RESPONDER_PASSWORD, so
-    # quietly sign in again with it to get a fresh idToken. If that isn't
-    # possible for any reason, fall back to the token we were given.
     id_token = payload.idToken
     try:
         lookup = _firebase_auth_request("lookup", {"idToken": payload.idToken})

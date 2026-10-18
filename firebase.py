@@ -12,6 +12,10 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from config import PROJECT_ID
 
+# Firebase Storage bucket (used for hazard resolution photos/videos).
+# Use the name without the "gs://" prefix.
+STORAGE_BUCKET = "livealert-d12cc.firebasestorage.app"
+
 _db = None
 # get_db() is called from FastAPI sync endpoints, which FastAPI runs in a
 # threadpool — so concurrent requests (e.g. the dashboard's polling firing
@@ -45,7 +49,10 @@ def get_db() -> firestore.Client:
                 raise FileNotFoundError("Firebase service account key not found")
             cred = credentials.Certificate(str(credential_path))
             try:
-                firebase_admin.initialize_app(cred, {"projectId": PROJECT_ID})
+                firebase_admin.initialize_app(
+                    cred,
+                    {"projectId": PROJECT_ID, "storageBucket": STORAGE_BUCKET},
+                )
             except ValueError:
                 # Defensive fallback: something else initialized the default
                 # app between our "if not firebase_admin._apps" check and

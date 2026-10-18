@@ -16,10 +16,17 @@ router = APIRouter(prefix="/accounts", tags=["Accounts"])
 # Three roles now, all living in the single Responders collection (see
 # "Collection routing" below):
 #
-#   super_admin      -> every page, no restrictions. Created ONLY via
-#                        auth.py's /auth/signup "Create Admin Account" flow.
-#   responder_admin   -> exactly dashboard, report, history, units. No
-#                        Stations, no Accounts. Created ONLY via this file's
+#   super_admin      -> exactly the Admin's pages (dashboard, report, history,
+#                        units, accounts) PLUS stations. Its DATA is scoped
+#                        to its own station like any other admin. Assign it from the Accounts page by
+#                        picking "Super Admin" as the role and the main
+#                        station (HQ) as the station. Only an existing
+#                        super_admin may grant the role.
+#   responder_admin   -> exactly dashboard, report, history, units, accounts.
+#                        No Stations. On the Accounts page they can only MANAGE
+#                        responders of their own station (assign role/rank,
+#                        assign unit, set status) — never create, delete or
+#                        reset accounts. Created ONLY via this file's
 #                        create_account() (the Accounts page). Shown in that
 #                        page's role dropdown as "Admin" — the stored value
 #                        is still "responder_admin"; only the label changed.
@@ -42,20 +49,29 @@ router = APIRouter(prefix="/accounts", tags=["Accounts"])
 # get_current_account / _serialize), which is mobile-only, i.e. zero pages —
 # not unrestricted and not even the four-page restricted set.
 # ---------------------------------------------------------------------------
-FULL_ACCESS_ROLES = {"super_admin"}
+FULL_ACCESS_ROLES = {"super_admin"}  # name kept: other modules may import it. Means "the super-admin role".
 MOBILE_ONLY_ROLES = {"responder"}
-RESTRICTED_PAGES = {"dashboard", "report", "history", "units"}
+RESTRICTED_PAGES = {"dashboard", "report", "history", "units", "accounts"}
+SUPER_ADMIN_EXTRA_PAGES = {"stations"}
+
+# Station admins ("responder_admin") managing accounts on the Accounts page.
+ADMIN_LEVEL_ROLES = {"super_admin", "responder_admin"}
+# The only fields a station admin may change on someone else's account.
+STATION_ADMIN_EDITABLE_FIELDS = {"role", "status", "unitId"}
+# Roles a station admin may hand out (lower-cased): Responder or Admin, never Super Admin.
+STATION_ADMIN_ASSIGNABLE_ROLES = {"responder", "responder_admin"}
 
 
-def get_allowed_pages(role: str) -> set[str] | None:
+def get_allowed_pages(role: str) -> set[str]:
     """
-    None means unrestricted (super_admin only); an empty set means no web
-    pages at all (plain field responders — mobile app only); otherwise the
-    fixed four-page allow-list (responder_admin).
+    An empty set means no web pages at all (plain field responders — mobile
+    app only); responder_admin gets the fixed four-page allow-list; super_admin
+    gets those same four pages plus stations and accounts. Nobody is
+    unrestricted any more, so this never returns None.
     """
     normalized = (role or "").strip().lower()
     if normalized in FULL_ACCESS_ROLES:
-        return None
+        return RESTRICTED_PAGES | SUPER_ADMIN_EXTRA_PAGES
     if normalized in MOBILE_ONLY_ROLES:
         return set()
     return RESTRICTED_PAGES
@@ -93,17 +109,17 @@ def get_current_account(x_account_id: str = Header(None, alias="X-Account-Id")) 
 NO_STATION_SCOPE = "__no_station_assigned__"
 
 
-def get_station_scope(account: dict = Depends(get_current_account)) -> str | None:
+def get_station_scope(account: dict = Depends(get_current_account)) -> str:
     """
     Which station's data the caller may see, resolved server-side from the
     X-Account-Id header (never from a client-supplied query param).
 
-      None            -> super_admin: unrestricted, sees every station.
-      "ST002"         -> anyone else: only reports/units routed to that station.
-      NO_STATION_SCOPE -> station-bound account with no stationId: sees nothing.
+      "ST002"         -> every account, super_admin included: only reports/units
+                         routed to that station.
+      NO_STATION_SCOPE -> account with no stationId: sees nothing.
+
+    There is no unrestricted scope any more, so this never returns None.
     """
-    if (account["role"] or "").strip().lower() in FULL_ACCESS_ROLES:
-        return None
     return account.get("stationId") or NO_STATION_SCOPE
 
 
@@ -175,6 +191,29 @@ class _RoutedDoc:
         return dict(self._data)
 
 
+# Roles that actually receive emergency calls, and the only duty value that
+# counts as "working". A missing/unknown duty value means NOT on duty, matching
+# duty.py (so a station is never assigned a call just because a responder doc
+# is missing the field).
+_CALL_ROLES = {"responder_admin", "super_admin"}
+
+
+def _on_duty_station_ids(db: Any) -> set[str]:
+    """Upper-cased ids of stations with at least one call-receiving responder
+    who is explicitly on duty."""
+    ids: set[str] = set()
+    for doc in db.collection("Responders").stream():
+        d = doc.to_dict() or {}
+        if str(d.get("role") or "").strip().lower() not in _CALL_ROLES:
+            continue
+        if str(d.get("duty") or "").strip().lower() != "on_duty":
+            continue
+        sid = str(d.get("stationId") or "").strip().upper()
+        if sid:
+            ids.add(sid)
+    return ids
+
+
 def route_unassigned(db: Any, docs: list) -> list:
     """Return docs, with any station-less ones routed to their nearest station
     (saved to Firestore). Docs that can't be routed (no coordinates, no station
@@ -191,8 +230,13 @@ def route_unassigned(db: Any, docs: list) -> list:
             out.append(doc)
             continue
         if stations is None:
+            on_duty_ids = _on_duty_station_ids(db)
             stations = []
             for s in db.collection("Stations").stream():
+                # Skip stations with nobody on duty; the call stays unassigned
+                # (and is retried on the next poll) if none qualify.
+                if s.id.strip().upper() not in on_duty_ids:
+                    continue
                 sd = s.to_dict() or {}
                 sc = station_coords(sd)
                 if sc is not None:
@@ -206,6 +250,7 @@ def route_unassigned(db: Any, docs: list) -> list:
             "stationId": sid,
             "stationName": sd.get("stationName", ""),
             "commanderName": sd.get("commanderName") or sd.get("chiefName", ""),
+            "dispatchStatus": "PENDING",
         })
         try:
             db.collection("ActiveCalls").document(doc.id).update(
@@ -376,6 +421,69 @@ def _serialize(doc_id: str, data: dict) -> dict:
     return account
 
 
+def _require_super_admin_caller(db, x_account_id: str | None) -> None:
+    """Granting the super_admin role is itself restricted to a super_admin."""
+    if not x_account_id:
+        raise HTTPException(status_code=401, detail="Missing X-Account-Id header")
+    snapshot = db.collection(RESPONDERS).document(x_account_id).get()
+    caller = snapshot.to_dict() or {} if snapshot.exists else {}
+    caller_role = (caller.get("role") or caller.get("position") or "").strip().lower()
+    if caller_role not in FULL_ACCESS_ROLES:
+        raise HTTPException(status_code=403, detail="Only a Super Admin can assign the Super Admin role.")
+
+
+def _role_of(data: dict) -> str:
+    return (data.get("role") or data.get("position") or "").strip().lower()
+
+
+def _get_caller(db, x_account_id: str | None) -> dict | None:
+    """Caller resolved from X-Account-Id, or None if missing / unknown."""
+    if not x_account_id:
+        return None
+    snapshot = db.collection(RESPONDERS).document(x_account_id).get()
+    if not snapshot.exists:
+        return None
+    data = snapshot.to_dict() or {}
+    return {
+        "id": x_account_id,
+        "role": _role_of(data),
+        "stationId": str(data.get("stationId") or "").strip(),
+    }
+
+
+def _require_super_admin(db, x_account_id: str | None, action: str) -> dict:
+    caller = _get_caller(db, x_account_id)
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Missing or unknown X-Account-Id header")
+    if caller["role"] not in FULL_ACCESS_ROLES:
+        raise HTTPException(status_code=403, detail=f"Only a Super Admin can {action}.")
+    return caller
+
+
+def _assert_may_assign_in_own_station(caller: dict, effective_station: str, role_change: bool, unit_change: bool) -> None:
+    """
+    A super admin may assign a role/rank or a unit only for accounts in THEIR
+    station. Clearing a unit (unitId null) is always allowed.
+    """
+    if not (role_change or unit_change):
+        return
+    effective_station = (effective_station or "").strip()
+    if not caller["stationId"] or effective_station != caller["stationId"]:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only assign roles and units for accounts in your own station.",
+        )
+
+
+def _assert_station_admin_may_manage(caller: dict, target: dict) -> None:
+    """A station admin may only touch non-admin accounts in their own station."""
+    target_station = str(target.get("stationId") or "").strip()
+    if not caller["stationId"] or target_station != caller["stationId"]:
+        raise HTTPException(status_code=403, detail="You can only manage accounts in your own station.")
+    if _role_of(target) in ADMIN_LEVEL_ROLES:
+        raise HTTPException(status_code=403, detail="Admins cannot manage Admin or Super Admin accounts.")
+
+
 def _find_account(db, account_id: str):
     """Returns (doc_ref, snapshot) or raises 404."""
     ref = db.collection(RESPONDERS).document(account_id)
@@ -400,10 +508,10 @@ def get_me(account: dict = Depends(get_current_account)):
 @router.get("/me/permissions")
 def get_my_permissions(account: dict = Depends(get_current_account)):
     """
-    Which pages the logged-in caller may see. `pages: null` means
-    unrestricted (super_admin); `pages: []` means no web pages at all (plain
-    field responders — mobile only); otherwise the exact allow-list, e.g.
-    responder_admin gets exactly ["dashboard", "report", "history", "units"].
+    Which pages the logged-in caller may see. `pages: []` means no web pages
+    at all (plain field responders — mobile only); otherwise the exact
+    allow-list: responder_admin gets ["accounts", "dashboard", "history",
+    "report", "units"], and super_admin gets those plus "stations".
 
     Frontend calls this after login and hides any nav item not in the list.
     The backend still enforces this on each route via require_page(), so
@@ -417,7 +525,12 @@ def get_my_permissions(account: dict = Depends(get_current_account)):
 
 
 @router.get("")
-def list_accounts(duty: str | None = None, status: str | None = None, role: str | None = None):
+def list_accounts(
+    duty: str | None = None,
+    status: str | None = None,
+    role: str | None = None,
+    x_account_id: str = Header(None, alias="X-Account-Id"),
+):
     """
     Frontend accounts page: the full roster (super_admin, responder_admin,
     and plain responders all live in the one Responders collection now).
@@ -434,9 +547,21 @@ def list_accounts(duty: str | None = None, status: str | None = None, role: str 
     status_filter = _normalize_status(status) if status else None
     role_filter = role.strip().lower() if role else None
 
+    # A station admin only gets responders from their own station — never
+    # Admin / Super Admin accounts and never other stations.
+    caller = _get_caller(db, x_account_id)
+    station_admin_scope = caller["stationId"] if caller and caller["role"] == "responder_admin" else None
+    scope_active = caller is not None and caller["role"] == "responder_admin"
+
     accounts = []
     for doc in db.collection(RESPONDERS).stream():
         account = _serialize(doc.id, doc.to_dict() or {})
+
+        if scope_active:
+            if not station_admin_scope or str(account["stationId"] or "").strip() != station_admin_scope:
+                continue
+            if account["role"].strip().lower() in ADMIN_LEVEL_ROLES:
+                continue
 
         if role_filter and account["role"].strip().lower() != role_filter:
             continue
@@ -468,23 +593,25 @@ def list_accounts(duty: str | None = None, status: str | None = None, role: str 
 
 
 @router.post("", status_code=201)
-def create_account(payload: AccountCreate):
+def create_account(payload: AccountCreate, x_account_id: str = Header(None, alias="X-Account-Id")):
     """
-    Creates a plain responder or a responder_admin ("Admin" in the Accounts
-    page dropdown; the stored role string is still "responder_admin").
-
-    Super Admins are NOT created here — that only happens via auth.py's
-    /auth/signup "Create Admin Account" flow, which writes straight into
-    Responders with role="super_admin".
+    Creates a plain responder, a responder_admin ("Admin" in the Accounts page
+    dropdown; the stored role string is still "responder_admin"), or a
+    super_admin ("Super Admin" in the dropdown; only a super_admin may do this).
     """
     requested_role = (payload.role or "Responder").strip()
-    if requested_role.lower() == "super_admin":
-        raise HTTPException(
-            status_code=409,
-            detail="Super Admin accounts can only be created via /auth/signup.",
-        )
 
     db = get_db()
+    # Adding accounts is a Super Admin action. Station admins can only manage
+    # existing accounts (see update_account).
+    caller = _require_super_admin(db, x_account_id, "create accounts")
+    _assert_may_assign_in_own_station(
+        caller,
+        payload.stationId,
+        role_change=requested_role.lower() != "responder",
+        unit_change=bool(payload.unitId),
+    )
+
     # If this account was created via /auth/signup first (the normal flow from
     # the Accounts page — see accounts.js), payload.id is that Firebase Auth
     # UID, and signup() has already written a doc under it (with an older,
@@ -523,18 +650,47 @@ def create_account(payload: AccountCreate):
 
 
 @router.patch("/{account_id}")
-def update_account(account_id: str, payload: AccountUpdate):
+def update_account(account_id: str, payload: AccountUpdate, x_account_id: str = Header(None, alias="X-Account-Id")):
     db = get_db()
     ref, snapshot = _find_account(db, account_id)
     existing = snapshot.to_dict() or {}
 
     data = payload.model_dump(exclude_unset=True)
 
-    if "role" in data and (data["role"] or "").strip().lower() == "super_admin":
-        raise HTTPException(
-            status_code=409,
-            detail="Super Admin role can only be granted via /auth/signup.",
-        )
+    caller = _get_caller(db, x_account_id)
+    if caller and caller["role"] == "responder_admin":
+        if caller["id"] == account_id:
+            # Editing yourself (e.g. clearing is_new after a password change) is
+            # fine, but an admin can't change their own role, station or status.
+            for field in ("role", "stationId", "status"):
+                data.pop(field, None)
+        else:
+            _assert_station_admin_may_manage(caller, existing)
+            # Only role / unit / status — identity, station and password flags are ignored.
+            data = {k: v for k, v in data.items() if k in STATION_ADMIN_EDITABLE_FIELDS}
+            if "role" in data:
+                new_role = _role_of({"role": data["role"]})
+                if new_role == _role_of(existing):
+                    data.pop("role")   # unchanged (e.g. an old rank being re-sent) — nothing to assign
+                elif new_role not in STATION_ADMIN_ASSIGNABLE_ROLES:
+                    raise HTTPException(status_code=403, detail="Admins can only assign the Responder or Admin role.")
+
+    if caller and caller["role"] in FULL_ACCESS_ROLES:
+        effective_station = str(data.get("stationId", existing.get("stationId")) or "")
+        role_change = "role" in data and _role_of({"role": data["role"]}) != _role_of(existing)
+        unit_change = bool(data.get("unitId")) and (data.get("unitId") or "") != (existing.get("unitId") or "")
+        _assert_may_assign_in_own_station(caller, effective_station, role_change, unit_change)
+        if role_change and caller["id"] == account_id:
+            raise HTTPException(status_code=403, detail="You cannot change your own role.")
+
+    # Granting super_admin, or changing the role of an existing super_admin
+    # (demoting one), is restricted to a super_admin.
+    existing_role = (existing.get("role") or existing.get("position") or "").strip().lower()
+    if "role" in data and (
+        (data["role"] or "").strip().lower() == "super_admin"
+        or (existing_role == "super_admin" and (data["role"] or "").strip().lower() != "super_admin")
+    ):
+        _require_super_admin_caller(db, x_account_id)
 
     # Normalize before writing so an admin UI sending "On Duty" or a mobile
     # client sending "on" can't put an unrecognized string into Firestore.
@@ -613,7 +769,7 @@ def set_duty(account_id: str, payload: DutyUpdate):
 
 
 @router.patch("/{account_id}/status")
-def set_status(account_id: str, payload: AccountUpdate):
+def set_status(account_id: str, payload: AccountUpdate, x_account_id: str = Header(None, alias="X-Account-Id")):
     """
     Set account status. Send {"status": "on"}, {"status": "off"}, or
     {"status": "inactive"} — same values the Accounts admin UI has always
@@ -629,6 +785,12 @@ def set_status(account_id: str, payload: AccountUpdate):
     ref, snapshot = _find_account(db, account_id)
     existing = snapshot.to_dict() or {}
 
+    caller = _get_caller(db, x_account_id)
+    if caller and caller["role"] == "responder_admin":
+        if caller["id"] == account_id:
+            raise HTTPException(status_code=403, detail="You cannot change your own status.")
+        _assert_station_admin_may_manage(caller, existing)
+
     new_status = _normalize_status(payload.status)
     status_data = {"status": new_status}
 
@@ -643,7 +805,7 @@ def set_status(account_id: str, payload: AccountUpdate):
 
 
 @router.post("/{account_id}/reset-password")
-def reset_password(account_id: str):
+def reset_password(account_id: str, x_account_id: str = Header(None, alias="X-Account-Id")):
     """
     Resets an account's login password back to the same default new accounts
     get (see DEFAULT_RESPONDER_PASSWORD) and re-arms is_new so they're forced
@@ -656,6 +818,7 @@ def reset_password(account_id: str):
         raise HTTPException(status_code=500, detail="firebase_admin auth is not available")
 
     db = get_db()
+    _require_super_admin(db, x_account_id, "reset passwords")
     ref, _ = _find_account(db, account_id)
 
     try:
@@ -672,8 +835,9 @@ def reset_password(account_id: str):
 
 
 @router.delete("/{account_id}")
-def delete_account(account_id: str):
+def delete_account(account_id: str, x_account_id: str = Header(None, alias="X-Account-Id")):
     db = get_db()
+    _require_super_admin(db, x_account_id, "revoke accounts")
     ref, _ = _find_account(db, account_id)
     ref.delete()
 

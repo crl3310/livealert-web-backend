@@ -272,6 +272,152 @@ def get_stats(station_id: str | None = Depends(get_station_scope)):
     }
 
 
+# ── Analytics (stats cards, charts and heatmap) ──────────────────────────────
+
+# Unit status values (lower-cased) that mean "not able to take a call".
+_UNAVAILABLE_UNIT_STATUSES = frozenset({"off", "offline", "inactive", "unavailable", "maintenance", "out of service"})
+_DEPLOYED_UNIT_STATUSES = frozenset({"deployed", "dispatched", "on call", "on_call", "busy", "responding", "en route"})
+
+
+def _to_coord(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number else None
+
+
+def _call_coordinates(data: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Latitude/longitude of an ActiveCalls document, wherever it was saved:
+    top-level lat/lng (or latitude/longitude), or inside `location` as a map
+    or a Firestore GeoPoint."""
+    loc_lat, loc_lng = _active_call_lat_lng(data.get("location"))
+    lat = _to_coord(data.get("lat", data.get("latitude")))
+    lng = _to_coord(data.get("lng", data.get("longitude")))
+    if lat is None or lng is None:
+        lat, lng = _to_coord(loc_lat), _to_coord(loc_lng)
+    if lat is None or lng is None or abs(lat) > 90 or abs(lng) > 180 or (lat == 0 and lng == 0):
+        return None, None
+    return lat, lng
+
+
+def _call_unit_ids(data: dict[str, Any]) -> list[str]:
+    assigned = data.get("assignedStation") or {}
+    raw = data.get("unitIds") if isinstance(data.get("unitIds"), list) else assigned.get("unitIds")
+    return [str(u) for u in (raw or []) if u]
+
+
+@router.get("/analytics")
+def get_analytics(
+    days: int = 366,
+    tz_offset: int = 0,
+    station_id: str | None = Depends(get_station_scope),
+):
+    """One call for the whole dashboard: every ActiveCalls report from the last
+    `days` days (with coordinates for the heatmap), plus unit / responder /
+    station numbers from the Units, Responders and Stations collections.
+
+    tz_offset = the browser's offset from UTC in minutes (Manila = 480) so
+    "today" means the viewer's day, not the UTC day."""
+    db = get_db()
+    days = max(1, min(days, 800))
+    now = datetime.now(timezone.utc)
+    offset = timedelta(minutes=max(-840, min(tz_offset, 840)))
+    today_start = (now + offset).replace(hour=0, minute=0, second=0, microsecond=0) - offset
+    yesterday_start = today_start - timedelta(days=1)
+    cutoff = now - timedelta(days=days)
+
+    # Stations: id -> display name
+    station_docs = list(db.collection("Stations").stream())
+    station_names = {}
+    for d in station_docs:
+        sd = d.to_dict() or {}
+        station_names[d.id] = sd.get("stationName") or sd.get("name") or d.id
+
+    # ActiveCalls: every report in range, plus which units are out on live calls
+    reports = []
+    today_reports = yesterday_reports = 0
+    busy_unit_ids: set[str] = set()
+    stations_with_live_calls: set[str] = set()
+    call_docs = route_unassigned(db, list(db.collection("ActiveCalls").stream()))
+    for doc in call_docs:
+        data = doc.to_dict() or {}
+        if not _matches_station(data, station_id):
+            continue
+        created_dt = _created_datetime(data)
+        sid = _report_station_id(data) or str(data.get("stationId") or "").strip()
+
+        if not _is_archived(data):
+            busy_unit_ids.update(_call_unit_ids(data))
+            if sid:
+                stations_with_live_calls.add(sid)
+
+        if created_dt is None:
+            continue
+        if created_dt >= today_start:
+            today_reports += 1
+        elif created_dt >= yesterday_start:
+            yesterday_reports += 1
+        if created_dt < cutoff:
+            continue
+
+        lat, lng = _call_coordinates(data)
+        ended_dt = _to_dt(data.get("endedAt"))
+        reports.append({
+            "id": doc.id,
+            "type": data.get("incidentType") or data.get("channelName") or "Unknown",
+            "urgency": _normalize_level(data.get("level")),
+            "status": data.get("status", "pending"),
+            "createdAt": created_dt.isoformat(),
+            "endedAt": ended_dt.isoformat() if ended_dt else None,
+            "stationId": sid,
+            "stationName": data.get("stationName") or station_names.get(sid, sid),
+            "location": _location_to_string(data.get("location")),
+            "lat": lat,
+            "lng": lng,
+            "unitCount": len(_call_unit_ids(data)),
+        })
+    reports.sort(key=lambda r: r["createdAt"], reverse=True)
+
+    # Units: deployed = out on a live call (or marked deployed); available = the rest that are on duty
+    unit_docs = list(db.collection("Units").stream())
+    if station_id:
+        unit_docs = [d for d in unit_docs if str((d.to_dict() or {}).get("stationId") or "").strip() == station_id.strip()]
+    units_total = units_deployed = units_available = 0
+    for d in unit_docs:
+        status = str((d.to_dict() or {}).get("status") or "").strip().lower()
+        if status in _UNAVAILABLE_UNIT_STATUSES:
+            continue
+        units_total += 1
+        if d.id in busy_unit_ids or status in _DEPLOYED_UNIT_STATUSES:
+            units_deployed += 1
+        else:
+            units_available += 1
+
+    # Responders (the people): same status field the stats card used before
+    responder_docs = list(db.collection("Responders").stream())
+    if station_id:
+        responder_docs = [d for d in responder_docs if (d.to_dict() or {}).get("stationId") == station_id]
+    responder_status = [str((d.to_dict() or {}).get("status") or "").strip().lower() for d in responder_docs]
+
+    return {
+        "generatedAt": now.isoformat(),
+        "todayReports": today_reports,
+        "yesterdayReports": yesterday_reports,
+        "reports": reports,
+        "units": {"total": units_total, "available": units_available, "deployed": units_deployed},
+        "responders": {
+            "total": len(responder_docs),
+            "available": responder_status.count("available"),
+            "deployed": responder_status.count("deployed"),
+        },
+        "stations": {
+            "total": len(station_docs) if not station_id else 1,
+            "withLiveReports": len(stations_with_live_calls),
+        },
+    }
+
+
 # ── Active Emergencies ────────────────────────────────────────────────────────
 
 @router.get("/active")
@@ -293,9 +439,13 @@ def get_active(station_id: str | None = Depends(get_station_scope)):
             continue
         assigned_station = data.get("assignedStation") or {}
         created_dt = _to_dt(data.get("timestamp") or data.get("createdAt"))
+        lat, lng = _active_call_lat_lng(data.get("location"))
         active.append({
             "id": doc.id,
             "incidentType": data.get("incidentType") or data.get("channelName") or "Unknown",
+            "location": _location_to_string(data.get("location")),
+            "lat": data.get("lat") or lat,
+            "lng": data.get("lng") or lng,
             "nearestStationId": data.get("nearestStationId") or assigned_station.get("stationId", ""),
             "reportedBy": data.get("reporterUuid") or data.get("reportedBy", ""),
             "respondersInvolved": data.get("respondersInvolved", []),

@@ -23,6 +23,10 @@ from history import router as history_router
 from report import router as report_router
 from stations import router as stations_router
 from units import router as units_router
+from hazard import router as hazard_router
+from maps_config import router as maps_config_router
+from duty import router as duty_router
+
 
 app = FastAPI(title="LiveAlert API", version="1.0.0")
 
@@ -54,6 +58,9 @@ app.include_router(report_router, prefix="/api/v1")
 app.include_router(stream_router,    prefix="/api/v1")
 app.include_router(stations_router,  prefix="/api/v1")
 app.include_router(units_router,     prefix="/api/v1")
+app.include_router(hazard_router, prefix="/api/v1")  # Hazards router
+app.include_router(maps_config_router, prefix="/api/v1")
+app.include_router(duty_router, prefix="/api/v1")  # Duty router
 
 
 @app.get("/")

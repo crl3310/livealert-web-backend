@@ -6,25 +6,27 @@ Uses Agora Web SDK for live broadcast and viewing.
 
 Endpoints:
     POST /api/v1/stream/create/{emergency_id}   — create a stream channel
-    GET  /api/v1/stream/token/{channel_id}       — get dynamic token for channel
-    GET  /api/v1/stream/join/{channel_id}        — broadcaster page
-    GET  /api/v1/stream/view/{channel_id}        — viewer page
-    GET  /api/v1/stream/{emergency_id}/summary   — full report summary with AI
+    GET  /api/v1/stream/token/{channel_id}      — get dynamic token for channel
+    GET  /api/v1/stream/join/{channel_id}       — broadcaster page
+    GET  /api/v1/stream/view/{channel_id}       — viewer page
+    GET  /api/v1/stream/{emergency_id}/summary   — full report summary
+    GET  /api/v1/stream/live-updates            — real-time SSE database stream
 """
 
 import uuid
 import time
+import asyncio
+import json
 from datetime import datetime, timezone
 from math import radians, sin, cos, sqrt, atan2
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from agora_token_builder import RtcTokenBuilder
 
 from accounts import get_station_scope, route_unassigned
 from config import AGORA_APP_ID, AGORA_APP_CERTIFICATE
 from firebase import get_db
-from gemini import generate_incident_summary
 
 router = APIRouter(prefix="/stream", tags=["Stream"])
 
@@ -61,21 +63,18 @@ def _get_unit_name(db, unit_id: str | None) -> str | None:
     return None
 
 
-def _normalize_level(level) -> str:
-    """Mirrors report.py's/dashboard.py's _normalize_level(). Without this,
-    this endpoint returned the raw Firestore value (e.g. just "3", or
-    whatever the AI assessment produced) unformatted, under the "level" key
-    only. report.py and dashboard.py both return a properly formatted
-    "Level 3" under the "urgency" key. Since this endpoint is what re-fetches
-    a report's data every time its detail page is opened, that mismatch
-    would overwrite the correctly-formatted cached entry with a raw/
-    mislabeled one — which is exactly why a report's displayed level could
-    change after visiting its detail page and navigating back to a list view."""
-    if isinstance(level, str) and level.lower().startswith("level"):
-        return level
-    if level in (None, ""):
-        return "Level 3"
-    return f"Level {level}"
+def _normalize_threat(threat) -> str:
+    """Mirrors report.py's _normalize_threat(). Threat level only: a missing
+    value is "Unknown", never a made-up level, and the same formatted value
+    is returned under the "threat" key everywhere so a report's displayed
+    level does not change after its detail page re-fetches it."""
+    if threat in (None, ""):
+        return "Unknown"
+    if isinstance(threat, str) and threat.lower().startswith("level"):
+        return threat
+    if str(threat).strip().isdigit():
+        return f"Level {str(threat).strip()}"
+    return str(threat)
 
 
 def _generate_agora_token(channel_id: str, uid: int = 0, expiration_seconds: int = 3600) -> str:
@@ -111,6 +110,66 @@ def _generate_agora_token(channel_id: str, uid: int = 0, expiration_seconds: int
         uid,
         1,
         privilege_expire_ts,
+    )
+
+
+# ── Real-Time SSE Updates ─────────────────────────────────────────────────────
+
+@router.get("/live-updates")
+async def live_updates(station_id: str = Depends(get_station_scope)):
+    """
+    Server-Sent Events (SSE) endpoint, scoped to the caller's station.
+    Only calls routed to the caller's station are pushed; everything else is
+    dropped server-side, so other stations' data never reaches the browser.
+    """
+    db = get_db()
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def snapshot_callback(col_snapshot, changes, read_time):
+        # Firestore calls this from its own thread, not the event loop.
+        for change in changes:
+            if change.type.name not in ("ADDED", "MODIFIED"):
+                continue
+
+            doc = change.document
+            try:
+                # A brand-new call has no station yet. Route it now (same as
+                # the list/summary endpoints do) so it reaches the right station
+                # immediately instead of being dropped until something else routes it.
+                doc = route_unassigned(db, [doc])[0]
+            except Exception:
+                pass
+
+            data = doc.to_dict() or {}
+            assigned = data.get("assignedStation") or {}
+            owner = str(data.get("nearestStationId") or assigned.get("stationId") or "").strip()
+            if owner != station_id:
+                continue  # not this station's call (also true for NO_STATION_SCOPE)
+
+            data["id"] = doc.id
+            loop.call_soon_threadsafe(queue.put_nowait, data)
+
+    query_watch = db.collection("ActiveCalls").on_snapshot(snapshot_callback)
+
+    async def event_generator():
+        try:
+            while True:
+                item = await queue.get()
+                yield f"data: {json.dumps(item, default=str)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            query_watch.unsubscribe()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -207,7 +266,6 @@ def join_stream(channel_id: str):
       status("Accessing camera and microphone...");
       
       try {{
-        // Fetch dynamic token from backend
         const tokenRes = await fetch(`/api/v1/stream/token/${{channelName}}`);
         if (!tokenRes.ok) throw new Error("Failed to get token");
         const tokenData = await tokenRes.json();
@@ -283,7 +341,6 @@ def view_stream(channel_id: str):
       }}
 
       try {{
-        // Fetch dynamic token from backend
         const tokenRes = await fetch(`/api/v1/stream/token/${{channelName}}`);
         if (!tokenRes.ok) throw new Error("Failed to get token");
         const tokenData = await tokenRes.json();
@@ -319,7 +376,7 @@ def view_stream(channel_id: str):
 def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_station_scope)):
     """
     Full Report Summary for 'View Report' page:
-      - AI-generated description + severity level (via Gemini)
+      - Description + severity level (as stored on the call)
       - Reported by (user name)
       - Location
       - Nearest stations with distances
@@ -327,7 +384,6 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
     """
     db = get_db()
 
-    # Active call
     doc = db.collection("ActiveCalls").document(emergency_id).get()
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Active call not found")
@@ -335,32 +391,11 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
     doc = route_unassigned(db, [doc])[0]
     data = doc.to_dict()
 
-    # Station admins may only open reports routed to their own station.
     if station_id:
         assigned = data.get("assignedStation") or {}
         if str(data.get("nearestStationId") or assigned.get("stationId") or "").strip() != station_id:
             raise HTTPException(status_code=404, detail="Active call not found")
 
-    # IMPORTANT: live.py's /get-token endpoint (the one the reporter's phone
-    # actually calls to start broadcasting) creates the ActiveCalls document
-    # using the real Agora channel name AS THE DOCUMENT ID, and also stores
-    # it in the "channelName" field. That is the one true channel the
-    # citizen's app is actually publishing video to.
-    #
-    # This endpoint used to read/generate an entirely separate
-    # "streamChannelId" field instead, and sign the returned token for THAT
-    # channel — while report.js's getStreamConfig() prioritizes
-    # report.channelName over report.streamChannelId and joins the REAL
-    # channel. Since Agora tokens are cryptographically bound to a specific
-    # channel name, a token signed for channel A is rejected when used to
-    # join channel B. That mismatch — not the credentials, not the token
-    # format — was the actual cause of
-    # "CAN_NOT_GET_GATEWAY_SERVER: invalid token, authorized failed".
-    #
-    # Fix: always prefer the real channelName (falling back to emergency_id
-    # itself, since that IS the channel name for docs created by live.py,
-    # and only inventing a placeholder for legacy/test docs that have
-    # neither) and generate the token for that exact same value.
     channel_id = data.get("channelName") or data.get("streamChannelId") or emergency_id
 
     if data.get("streamChannelId") != channel_id:
@@ -370,7 +405,6 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
     incident_type = data.get("incidentType") or data.get("channelName") or "Unknown"
     location = data.get("location", "")
 
-    # Location string
     location_str = ""
     if isinstance(location, str):
         location_str = location
@@ -379,8 +413,6 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
     elif hasattr(location, "latitude"):
         location_str = f"{location.latitude}, {location.longitude}"
 
-    # Reporter (ActiveCalls uses reporterUuid; fall back to reportedBy for
-    # compatibility with any older docs)
     reporter_id = data.get("reporterUuid") or data.get("reportedBy", "")
     reporter_name = "Unknown"
     if reporter_id:
@@ -391,12 +423,8 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
             last = u.get("lastName", "")
             reporter_name = f"{first} {last}".strip() or u.get("name", "Unknown")
         else:
-            # Not every reporterUuid on ActiveCalls resolves to a real Users
-            # doc (e.g. test data), so fall back to showing the raw value
-            # instead of "Unknown".
             reporter_name = reporter_id
 
-    # Active call coordinates — ActiveCalls stores latitude/longitude, not lat/lng
     e_lat, e_lng = None, None
     if hasattr(location, "latitude"):
         e_lat, e_lng = location.latitude, location.longitude
@@ -404,7 +432,6 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
         e_lat = location.get("latitude", location.get("lat"))
         e_lng = location.get("longitude", location.get("lng"))
 
-    # Stations with distances
     station_docs = list(db.collection("Stations").stream())
     stations = []
     current_nearest = data.get("nearestStationId") or assigned_station.get("stationId", "")
@@ -436,26 +463,20 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
 
     stations.sort(key=lambda x: x["distanceKm"] if x["distanceKm"] is not None else 9999)
 
-    # Gemini AI — generate description and level
-    ai = generate_incident_summary(incident_type, location_str)
-
-    # Save level back to Firestore if not already set
-    if not data.get("level"):
-        db.collection("ActiveCalls").document(emergency_id).update({"level": ai["level"]})
-
-    normalized_level = _normalize_level(data.get("level") or ai["level"])
+    # Same default report.py uses when a call has no threat level yet.
+    normalized_threat = _normalize_threat(data.get("threatLevel"))
 
     analyzed_at = _to_dt(data.get("analyzed_at") or data.get("analyzedAt"))
     unit_ids = data.get("unitIds")
     if not isinstance(unit_ids, list):
-      unit_ids = assigned_station.get("unitIds")
+        unit_ids = assigned_station.get("unitIds")
     if not isinstance(unit_ids, list):
-      unit_ids = [assigned_station.get("unitId") or data.get("unitId")]
+        unit_ids = [assigned_station.get("unitId") or data.get("unitId")]
     unit_ids = list(dict.fromkeys(unit_id for unit_id in unit_ids if unit_id))
     unit_id = assigned_station.get("unitId") or data.get("unitId") or (unit_ids[0] if unit_ids else None)
     assigned_station = {
-      **{key: value for key, value in assigned_station.items() if key != "unitIds"},
-      "unitId": unit_id,
+        **{key: value for key, value in assigned_station.items() if key != "unitIds"},
+        "unitId": unit_id,
     }
 
     return {
@@ -463,12 +484,9 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
         "incidentType": incident_type,
         "channelName": data.get("channelName"),
         "status": data.get("status", "pending"),
-        "level": normalized_level,
-        # Alias under the field name list views (dashboard.js, history.js)
-        # actually read — see _normalize_level() above for why this matters.
-        "urgency": normalized_level,
+        "threat": normalized_threat,
         "threatLevel": data.get("threatLevel"),
-        "description": data.get("description") or data.get("ai_assessment") or ai["description"],
+        "description": data.get("description") or data.get("ai_assessment") or f"{incident_type} reported at {location_str or 'an unknown location'}.",
         "aiAssessment": data.get("ai_assessment"),
         "aiReasoning": data.get("ai_reasoning"),
         "aiSummary": data.get("ai_summary"),
@@ -479,15 +497,12 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
         },
         "location": location_str,
         "locationRaw": data.get("location") if isinstance(data.get("location"), dict) else None,
+        # Coordinates were computed above (e_lat/e_lng) but never sent, so the map had nothing to pin.
+        "lat": e_lat,
+        "lng": e_lng,
         "nearestStations": stations,
         "respondersInvolved": data.get("respondersInvolved", []),
         "assignedStation": assigned_station,
-        # Flat alias of nearestStationId / assignedStation.stationId, under the
-        # name the frontend's unit-assignment dropdown (report.js, dashboard.js)
-        # actually reads. Without this, the dropdown always rendered disabled
-        # ("no assigned station yet") for every report opened from the
-        # dashboard, since this endpoint — not report.py's /reports/recent —
-        # is what ultimately populates the incident tracker modal.
         "stationId": current_nearest,
         "unitId": unit_id,
         "unitName": _get_unit_name(db, unit_id),
@@ -495,13 +510,89 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
         "viewUrl": f"/api/v1/stream/view/{channel_id}" if channel_id else None,
         "joinUrl": f"/api/v1/stream/join/{channel_id}" if channel_id else None,
         "agoraAppId": AGORA_APP_ID,
-        # report.js's getStreamConfig() reads this field directly and passes
-        # it into client.join() for the inline "Agora Live Incident Feed"
-        # panel on the report page. Without it, that join always used null,
-        # which Agora's gateway rejects once App Certificate is enabled
-        # (CAN_NOT_GET_GATEWAY_SERVER: dynamic use static key) — the same
-        # class of bug as the broken _generate_agora_token, just missing
-        # from a different response entirely.
         "token": _generate_agora_token(channel_id) if channel_id else None,
         "createdAt": _to_dt(data.get("timestamp") or data.get("createdAt")),
-    }
+    }             
+
+
+# ── Responder locations ───────────────────────────────────────────────────────
+# Each responding unit's phone writes its position to ActiveCalls/{id}.responderLocations
+# (a map keyed by unit id). The report map polls this lightweight endpoint to draw
+# the responders and their routes.
+
+_NAME_CACHE: dict[str, tuple[float, str | None]] = {}
+_NAME_CACHE_TTL_SECONDS = 60
+
+
+def _cached_name(db, collection: str, doc_id: str | None, build) -> str | None:
+    """Name lookups are cached for a minute: the map polls every few seconds."""
+    if not doc_id:
+        return None
+    key = f"{collection}/{doc_id}"
+    now = time.time()
+    hit = _NAME_CACHE.get(key)
+    if hit and now - hit[0] < _NAME_CACHE_TTL_SECONDS:
+        return hit[1]
+    name = None
+    try:
+        snap = db.collection(collection).document(str(doc_id)).get()
+        if snap.exists:
+            name = build(snap.to_dict() or {})
+    except Exception:
+        pass
+    _NAME_CACHE[key] = (now, name)
+    return name
+
+
+def _person_name(data: dict) -> str | None:
+    full = f"{data.get('firstName', '')} {data.get('lastName', '')}".strip()
+    return data.get("name") or full or None
+
+
+def _point_from(value):
+    if isinstance(value, dict):
+        return value.get("latitude", value.get("lat")), value.get("longitude", value.get("lng"))
+    if hasattr(value, "latitude"):
+        return value.latitude, value.longitude
+    return None, None
+
+
+@router.get("/{emergency_id}/responders")
+def get_responder_locations(emergency_id: str, station_id: str | None = Depends(get_station_scope)):
+    """Live positions of the units responding to this emergency."""
+    db = get_db()
+    snap = db.collection("ActiveCalls").document(emergency_id).get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Active call not found")
+    data = snap.to_dict() or {}
+
+    if station_id:
+        assigned = data.get("assignedStation") or {}
+        if str(data.get("nearestStationId") or assigned.get("stationId") or "").strip() != station_id:
+            raise HTTPException(status_code=404, detail="Active call not found")
+
+    raw = data.get("responderLocations")
+    responders = []
+    if isinstance(raw, dict):
+        for unit_id, entry in raw.items():
+            if not isinstance(entry, dict):
+                continue
+            lat, lng = _point_from(entry)
+            if lat is None or lng is None:
+                lat, lng = _point_from(entry.get("coordinates"))
+            if lat is None or lng is None:
+                continue
+            updated = _to_dt(entry.get("updatedAt"))
+            uid = entry.get("updatedByUid")
+            responders.append({
+                "id": unit_id,
+                "unitName": _cached_name(db, "Units", unit_id, lambda d: d.get("unitName")),
+                "responderName": _cached_name(db, "Responders", uid, _person_name),
+                "lat": lat,
+                "lng": lng,
+                "heading": entry.get("heading"),
+                "speed": entry.get("speed"),
+                "updatedAt": updated.isoformat() if updated else None,
+            })
+
+    return {"responders": responders, "count": len(responders)}

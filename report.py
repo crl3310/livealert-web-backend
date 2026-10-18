@@ -6,6 +6,8 @@ from pydantic import BaseModel
 
 from accounts import get_station_scope, route_unassigned
 from firebase import get_db
+from history import _bucket_video_urls, _remarks_out, _video_urls
+from units import _on_duty_responders
 
 try:
     from google.cloud import firestore  # type: ignore
@@ -49,6 +51,12 @@ def _matches_station(data: dict[str, Any], station_id: str | None) -> bool:
 
 
 
+class ResponderSnapshot(BaseModel):
+    id: str = ""
+    name: str = ""
+    unitName: str = ""
+
+
 class ReportUpdate(BaseModel):
     status: str | None = None
     level: str | None = None
@@ -56,6 +64,10 @@ class ReportUpdate(BaseModel):
     description: str | None = None
     nearestStationId: str | None = None
     unitIds: list[str] | None = None  # full list of assigned units (replaces existing; [] unassigns all)
+    # Sent by End Dispatch together with status="resolved"; only stored on that first transition.
+    resolvedBy: str | None = None
+    resolvedById: str | None = None
+    deployedResponders: list[ResponderSnapshot] | None = None
 
 
 def _to_dt(firestore_ts):
@@ -84,12 +96,15 @@ def _location_to_string(location: Any) -> str:
     return "Unknown location"
 
 
-def _normalize_level(level: Any) -> str:
-    if isinstance(level, str) and level.lower().startswith("level"):
-        return level
-    if level in (None, ""):
-        return "Level 3"
-    return f"Level {level}"
+def _normalize_threat(threat: Any) -> str:
+    """Threat level only. Missing -> "Unknown" (never a made-up level)."""
+    if threat in (None, ""):
+        return "Unknown"
+    if isinstance(threat, str) and threat.lower().startswith("level"):
+        return threat
+    if str(threat).strip().isdigit():
+        return f"Level {str(threat).strip()}"
+    return str(threat)
 
 
 def _format_time(created_dt: datetime | None) -> str:
@@ -174,7 +189,7 @@ def _extract_unit_ids(data: dict[str, Any]) -> list[str]:
     return unit_ids
 
 
-def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any) -> dict[str, Any]:
+def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media: bool = False) -> dict[str, Any]:
     created_dt = _to_dt(data.get("timestamp") or data.get("createdAt"))
     location = data.get("location") if isinstance(data.get("location"), dict) else {}
     location_str = _location_to_string(data.get("location"))
@@ -200,7 +215,7 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any) -> dict[st
         "type": incident_type,
         "location": location_str,
         "time": _format_time(created_dt),
-        "urgency": _normalize_level(data.get("level")),
+        "threat": _normalize_threat(data.get("threatLevel")),
         "reporter": _get_reporter_name(db, data.get("reporterUuid") or data.get("reportedBy")),
         "description": description,
         "lat": data.get("lat") or location.get("latitude") or location.get("lat"),
@@ -224,6 +239,17 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any) -> dict[st
         # Set once, server-side, the moment a PATCH moves status into
         # ENDED_STATUSES (see update_report below) — not client-writable.
         "endedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
+        "resolvedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
+        "threatLevel": data.get("threatLevel"),
+        "resolvedBy": data.get("resolvedBy") or "",
+        "resolvedById": data.get("resolvedById") or "",
+        # Remarks: False until the admin writes them (or if they chose "later").
+        "haveRemarks": bool(data.get("haveRemarks")),
+        "remarks": _remarks_out(data),
+        "deployedUnits": data.get("deployedUnits") or [],
+        "deployedResponders": data.get("deployedResponders") or [],
+        "videoUrls": _video_urls(data, sign=sign_media),
+        "evidenceUploadedAt": data.get("evidence_uploaded_at") and _to_dt(data.get("evidence_uploaded_at")) and _to_dt(data.get("evidence_uploaded_at")).isoformat(),
     }
 
 
@@ -262,7 +288,14 @@ def get_report_detail(report_id: str, station_id: str | None = Depends(get_stati
         doc = route_unassigned(db, [doc])[0]
     if not doc.exists or not _matches_station(doc.to_dict() or {}, station_id):
         raise HTTPException(status_code=404, detail="Report not found")
-    return _build_report_payload(doc.id, doc.to_dict() or {}, db)
+    payload = _build_report_payload(doc.id, doc.to_dict() or {}, db, sign_media=True)
+    if not payload["videoUrls"]:  # the evidence upload may have been saved on the legacy Emergencies copy
+        legacy = db.collection("Emergencies").document(report_id).get()
+        if legacy.exists:
+            payload["videoUrls"] = _video_urls(legacy.to_dict() or {}, sign=True)
+    if not payload["videoUrls"] and _has_ended(doc.to_dict() or {}):
+        payload["videoUrls"] = _bucket_video_urls(report_id)  # <report id>.mp4 in the storage bucket
+    return payload
 
 
 @router.patch("/{report_id}")
@@ -286,8 +319,25 @@ def update_report(report_id: str, payload: ReportUpdate):
         was_ended = _has_ended(existing_data)
         if new_status_ended and not was_ended:
             data["endedAt"] = datetime.now(timezone.utc)
+            # Snapshot who handled it. Units come from the report itself (not the client).
+            data["haveRemarks"] = bool(existing_data.get("haveRemarks"))
+            data["deployedUnits"] = [
+                {"id": uid, "name": _get_unit_name(db, uid) or uid}
+                for uid in _extract_unit_ids(existing_data)
+            ]
+            if "deployedResponders" in data:
+                data["deployedResponders"] = [r.model_dump() if hasattr(r, "model_dump") else r for r in (data["deployedResponders"] or [])][:50]
+            # The admin who answered the emergency: id + name are saved together with the resolved status.
+            data["resolvedById"] = (data.get("resolvedById") or "").strip()[:120]
+            data["resolvedBy"] = (data.get("resolvedBy") or "").strip()[:120]
+            if data["resolvedById"] and not data["resolvedBy"]:
+                data["resolvedBy"] = _get_reporter_name(db, data["resolvedById"])  # look the name up from Users
         elif not new_status_ended and was_ended and existing_data.get("endedAt") is not None:
             data["endedAt"] = firestore.DELETE_FIELD
+
+    if not ("status" in data and "endedAt" in data and data["endedAt"] is not firestore.DELETE_FIELD):
+        for field in ("resolvedBy", "resolvedById", "deployedResponders"):
+            data.pop(field, None)
 
     # Assigning units — validate every unit exists and belongs to the same
     # station this report is assigned to. Without this, a stale/typo'd unitId
@@ -308,6 +358,17 @@ def update_report(report_id: str, payload: ReportUpdate):
             or existing_assigned.get("stationId")
         )
 
+        # Units newly being added must be available: active AND with at least
+        # one responder on duty (same rule as "Can receive reports" on the
+        # Units page). Units already on the report are left alone, so saving
+        # never fails just because an assigned unit has since gone offline.
+        already_assigned = set(_extract_unit_ids(existing_data))
+        newly_added = {uid for uid in unit_ids if uid not in already_assigned}
+        on_duty_unit_ids = (
+            {r["unitId"] for r in _on_duty_responders(db) if r.get("unitId")}
+            if newly_added else set()
+        )
+
         for uid in unit_ids:
             unit_doc = db.collection("Units").document(uid).get()
             if not unit_doc.exists:
@@ -318,6 +379,14 @@ def update_report(report_id: str, payload: ReportUpdate):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Unit '{uid}' belongs to a different station than this report is assigned to.",
+                )
+
+            if uid in newly_added and (
+                unit_data.get("status", "on") != "on" or uid not in on_duty_unit_ids
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unit '{unit_data.get('unitName') or uid}' is not available. It must be active with a responder on duty.",
                 )
 
         # Read-merge-write against the live doc (rather than trusting a
