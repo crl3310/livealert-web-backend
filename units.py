@@ -60,15 +60,18 @@ def _is_on_duty(data: dict) -> bool:
 _RESPONDER_COLLECTIONS = ("Responders", "Accounts", "Users")
 
 
-def _on_duty_responders(db, station_id: str) -> list[dict]:
-    """On-duty responders of ONE station, as small records the frontend can match on."""
+def _on_duty_responders(db, station_id: str | None = None) -> list[dict]:
+    """On-duty responders as small records the frontend can match on.
+
+    station_id=None means every station (used internally, e.g. by report.py);
+    the Units page passes the caller's station so it only sees its own people."""
     out, seen = [], set()
     for coll in _RESPONDER_COLLECTIONS:
         for doc in db.collection(coll).stream():
             if doc.id in seen:
                 continue
             data = doc.to_dict() or {}
-            if str(data.get("stationId") or "").strip() != station_id:
+            if station_id is not None and str(data.get("stationId") or "").strip() != station_id:
                 continue
             if not _is_on_duty(data):
                 continue
