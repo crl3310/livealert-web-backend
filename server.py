@@ -25,7 +25,6 @@ from stations import router as stations_router
 from units import router as units_router
 from hazard import router as hazard_router
 from maps_config import router as maps_config_router
-from duty import router as duty_router
 
 
 IS_PROD = os.getenv("ENVIRONMENT") == "production"
@@ -50,10 +49,10 @@ async def log_requests(request: Request, call_next):
     print(f"Response status: {request.method} {request.url.path} -> {response.status_code}")
     return response
 
-ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
+#ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
 
 # Uncomment while developing locally:
-#ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
+ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,7 +72,6 @@ app.include_router(stations_router,  prefix="/api/v1")
 app.include_router(units_router,     prefix="/api/v1")
 app.include_router(hazard_router, prefix="/api/v1")  # Hazards router
 app.include_router(maps_config_router, prefix="/api/v1")
-app.include_router(duty_router, prefix="/api/v1")  # Duty router
 
 
 @app.get("/")

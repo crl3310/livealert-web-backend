@@ -379,7 +379,7 @@ def get_analytics(
         })
     reports.sort(key=lambda r: r["createdAt"], reverse=True)
 
-    # Units: deployed = out on a live call (or marked deployed); available = the rest that are on duty
+    # Units: deployed = out on a live call (or marked deployed); available = the rest that are in service
     unit_docs = list(db.collection("Units").stream())
     if station_id:
         unit_docs = [d for d in unit_docs if str((d.to_dict() or {}).get("stationId") or "").strip() == station_id.strip()]

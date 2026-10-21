@@ -6,7 +6,10 @@ from pydantic import BaseModel
 
 from accounts import get_station_scope, require_page, route_unassigned
 from firebase import get_db
-from history import _bucket_video_urls, _remarks_out, _video_urls
+from history import (
+    _bucket_video_urls, _find_incident_report_raw, _has_real_ai, _incident_report_out,
+    _remarks_out, _resolve_threat, _video_urls,
+)
 from units import _on_duty_responders
 
 try:
@@ -105,6 +108,22 @@ def _normalize_threat(threat: Any) -> str:
     if str(threat).strip().isdigit():
         return f"Level {str(threat).strip()}"
     return str(threat)
+
+
+# The threatLevel stored on a new report is only a default (it was showing "Level 2" at once). Until the
+# AI has written its assessment the level is not real, so the payload carries an `aiPending` flag the
+# frontend uses to show "Pending" / "Analyzing..." instead of the level.
+AI_PENDING_MAX = timedelta(minutes=2)  # if the AI never answers, stop waiting and show the stored level
+
+
+def _is_ai_pending(data: dict[str, Any], created_dt: datetime | None) -> bool:
+    if _has_ended(data):
+        return False
+    if _has_real_ai(data):
+        return False
+    if created_dt is not None and datetime.now(timezone.utc) - created_dt > AI_PENDING_MAX:
+        return False
+    return True
 
 
 def _format_time(created_dt: datetime | None) -> str:
@@ -210,12 +229,19 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media
         or f"{incident_type} reported at {location_str}."
     )
 
+    # The level stored on a report is only a default until the AI has assessed it, so it is not shown as-is:
+    # Fake (AI rejected it), Unknown (not assessed / inconclusive) or the real level. See history._resolve_threat.
+    threat_label, threat_level = _resolve_threat(data)
+
+    # The responder's IncidentReport (a map on the report document). Only on the detail view: it looks up unit names.
+    incident_report = _incident_report_out(_find_incident_report_raw(None, data), db) if sign_media else None
+
     return {
         "id": doc_id,
         "type": incident_type,
         "location": location_str,
         "time": _format_time(created_dt),
-        "threat": _normalize_threat(data.get("threatLevel")),
+        "threat": threat_label,
         "reporter": _get_reporter_name(db, data.get("reporterUuid") or data.get("reportedBy")),
         "description": description,
         "lat": data.get("lat") or location.get("latitude") or location.get("lat"),
@@ -240,7 +266,11 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media
         # ENDED_STATUSES (see update_report below) — not client-writable.
         "endedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
         "resolvedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
-        "threatLevel": data.get("threatLevel"),
+        "threatLevel": threat_level,
+        # Creation time as an ISO string WITH timezone (the frontend's Pending stage counts from it),
+        # and whether the AI is still working on this report (the stored threat level is only a default until then).
+        "createdAt": created_dt.isoformat() if created_dt else None,
+        "aiPending": _is_ai_pending(data, created_dt),
         "resolvedBy": data.get("resolvedBy") or "",
         "resolvedById": data.get("resolvedById") or "",
         # Remarks: False until the admin writes them (or if they chose "later").
@@ -248,6 +278,7 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media
         "remarks": _remarks_out(data),
         "deployedUnits": data.get("deployedUnits") or [],
         "deployedResponders": data.get("deployedResponders") or [],
+        "incidentReport": incident_report,
         "videoUrls": _video_urls(data, sign=sign_media),
         "evidenceUploadedAt": data.get("evidence_uploaded_at") and _to_dt(data.get("evidence_uploaded_at")) and _to_dt(data.get("evidence_uploaded_at")).isoformat(),
     }

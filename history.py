@@ -1,5 +1,8 @@
 import logging
 import os
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -97,6 +100,64 @@ def _normalize_threat(threat: Any) -> str:
     if str(threat).strip().isdigit():
         return f"Level {str(threat).strip()}"
     return str(threat)
+
+
+# ---------------------------------------------------------------------------
+# What threat level a report may show. The level stored on a report at creation is only a default (it was
+# "Level 2"), so it is shown only once the AI has really assessed the report:
+#   - AI rejected it (assessment starts with "Rejected"), or it was marked cancelled_fake -> "Fake"
+#   - no AI assessment yet, a placeholder, or an inconclusive one ("likely fake", "needs manual review") -> "Unknown"
+#   - otherwise -> the stored level ("Level 1/2/3")
+# report.py uses the same rule so the live report page and History always agree.
+# ---------------------------------------------------------------------------
+_AI_FIELDS = ("ai_summary", "ai_reasoning", "ai_assessment", "ai_analysis",
+              "aiSummary", "aiReasoning", "aiAssessment", "aiAnalysis")
+_REJECTED_RE = re.compile(r"^\W*rejected\b", re.IGNORECASE)
+_INCONCLUSIVE_RE = re.compile(
+    r"(likely|probably|possibly|may be|might be|appears to be)\s+(to be\s+)?(a\s+)?(fake|false|hoax|prank)"
+    r"|manual review|no verification|unable to verif|cannot (be )?verif|inconclusive|insufficient",
+    re.IGNORECASE,
+)
+
+
+def _ai_text(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("summary") or value.get("assessment") or value.get("reasoning") or ""
+    return str(value or "").strip()
+
+
+def _is_real_ai_text(value: Any) -> bool:
+    """True for an actual AI assessment; False for empty text or a placeholder like 'AI analysis in progress.'"""
+    text = _ai_text(value)
+    if not text:
+        return False
+    if len(text) < 60 and any(w in text.lower() for w in ("in progress", "pending", "analyzing", "analysing", "awaiting")):
+        return False
+    return True
+
+
+def _has_real_ai(data: dict[str, Any]) -> bool:
+    return any(_is_real_ai_text(data.get(k)) for k in _AI_FIELDS)
+
+
+def _ai_rejected(data: dict[str, Any]) -> bool:
+    if str(data.get("status") or "").strip().lower() == "cancelled_fake":
+        return True
+    return any(_REJECTED_RE.match(_ai_text(data.get(k))) for k in _AI_FIELDS)
+
+
+def _ai_inconclusive(data: dict[str, Any]) -> bool:
+    return any(_INCONCLUSIVE_RE.search(_ai_text(data.get(k))) for k in _AI_FIELDS)
+
+
+def _resolve_threat(data: dict[str, Any]) -> tuple[str, Any]:
+    """(label to show, raw threatLevel to send) for a report."""
+    if _ai_rejected(data):
+        return "Fake", None
+    if not _has_real_ai(data) or _ai_inconclusive(data):
+        return "Unknown", None
+    level = data.get("threatLevel")
+    return _normalize_threat(level), level
 
 
 def _format_time(created_dt: datetime | None) -> str:
@@ -229,21 +290,206 @@ def _video_urls(data: dict[str, Any], sign: bool = False) -> list[str]:
     return urls
 
 
+# ---------------------------------------------------------------------------
+# IncidentReport: what the responder submits after an incident (written from the mobile app).
+# It lives with the report in the ActiveCalls collection. Where exactly is not fixed in stone, so it is
+# looked up in the three places it can be: an "IncidentReport" map on the call document, an
+# "IncidentReport" subcollection of it, or a document named "IncidentReport" in any other subcollection.
+# ---------------------------------------------------------------------------
+_KEY_RE = re.compile(r"[^a-z0-9]")
+
+
+def _norm_key(key: Any) -> str:
+    return _KEY_RE.sub("", str(key).lower())
+
+
+def _pick(raw: dict[str, Any], *aliases: str) -> Any:
+    """First non-empty value among the alias names (case / underscore insensitive). 0 counts as a value."""
+    lookup = {_norm_key(k): v for k, v in raw.items()}
+    for alias in aliases:
+        value = lookup.get(_norm_key(alias))
+        if value is not None and value != "" and value != [] and value != {}:
+            return value
+    return None
+
+
+def _count(value: Any) -> int | None:
+    """A number of people. Accepts 3, "3", ["A", "B"] (-> 2) or "none" (-> 0); anything else -> None (not recorded)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    text = str(value).strip().lower()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    if text in ("none", "nil", "no", "zero"):
+        return 0
+    return None
+
+
+def _text(value: Any) -> str | None:
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def _person_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = _pick(value, "name", "fullName", "displayName", "responderName", "username")
+    return _text(value)
+
+
+def _people_out(value: Any) -> Any:
+    """People involved: a list of {name, detail}, or the plain text / number if that is how it was saved."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        people = []
+        for entry in value:
+            if isinstance(entry, dict):
+                name = _person_name(entry) or "Unnamed person"
+                bits = [_text(_pick(entry, k)) for k in ("role", "age", "sex", "gender", "condition", "status", "relation")]
+                people.append({"name": name, "detail": ", ".join(b for b in bits if b)})
+            elif _text(entry):
+                people.append({"name": _text(entry), "detail": ""})
+        return people or None
+    if isinstance(value, dict):
+        return _people_out([value])
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    return _text(value)
+
+
+def _unit_name(db: Any, value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = _pick(value, "unitName", "name", "id")
+    unit = _text(value)
+    if not unit:
+        return None
+    try:  # it may be a unit id: show the unit's name instead
+        snap = db.collection("Units").document(unit).get()
+        if snap.exists:
+            return _text((snap.to_dict() or {}).get("unitName")) or unit
+    except Exception:  # noqa: BLE001 - a name lookup must never break the page
+        pass
+    return unit
+
+
+def _pretty_outcome(text: str | None) -> str | None:
+    """"resolved_on_scene" -> "Resolved on scene" (a code word becomes readable; a sentence is left alone)."""
+    if text and " " not in text and re.search(r"[_-]", text):
+        text = re.sub(r"[_-]+", " ", text).strip()
+        return text[:1].upper() + text[1:]
+    return text
+
+
+def _incident_unit_ids(raw: dict[str, Any]) -> list[str]:
+    """The responder's own unit first (reportedByUnitId), then every unit on the incident (unitIds)."""
+    many = _pick(raw, "unitIds", "units")
+    candidates = [_pick(raw, "reportedByUnitId", "unitId", "unit", "unitName")]
+    candidates += list(many) if isinstance(many, (list, tuple)) else [many]
+    ids: list[str] = []
+    for value in candidates:
+        if isinstance(value, dict):
+            value = _pick(value, "id", "unitId", "unitName", "name")
+        text = _text(value)
+        if text and text not in ids:
+            ids.append(text)
+    return ids
+
+
+def _sub_collections(ref: Any) -> list[Any]:
+    lister = getattr(ref, "collections", None) or getattr(ref, "list_collections", None)
+    return list(lister()) if lister else []
+
+
+def _find_incident_report_raw(ref: Any, data: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The raw IncidentReport for one report document, or None when the responder has not filled it in."""
+    for key in ("IncidentReport", "incidentReport", "incident_report"):
+        embedded = (data or {}).get(key)
+        if isinstance(embedded, dict) and embedded:
+            return embedded
+    if ref is None:
+        return None
+    for sub in _sub_collections(ref):
+        if _norm_key(sub.id).startswith("incidentreport"):
+            docs = [d.to_dict() or {} for d in sub.limit(20).stream()]
+            docs = [d for d in docs if d]
+            if docs:
+                # more than one submission: the most recently submitted one
+                return max(docs, key=lambda d: str(_iso(_pick(d, "submittedAt", "createdAt", "timestamp", "time")) or ""))
+        snap = sub.document("IncidentReport").get()
+        if snap.exists and (snap.to_dict() or {}):
+            return snap.to_dict()
+    return None
+
+
+def _incident_report_out(raw: dict[str, Any] | None, db: Any) -> dict[str, Any] | None:
+    """The responder's report in the shape the History page shows. Missing values stay None (= "Not recorded")."""
+    if not raw:
+        return None
+    unit_names: list[str] = []
+    for unit_id in _incident_unit_ids(raw):
+        name = _unit_name(db, unit_id)
+        if name and name not in unit_names:
+            unit_names.append(name)
+    out = {
+        "fatalities": _count(_pick(raw, "fatalities", "fatality", "fatalityCount", "numberOfFatalities", "deaths", "deathCount", "numberOfDeaths", "dead")),
+        "injuries": _count(_pick(raw, "injuries", "injured", "injuredPersons", "injuredPeople", "injuredCount", "injuryCount", "numberOfInjuries", "numberOfInjured")),
+        "outcome": _pretty_outcome(_text(_pick(raw, "outcome", "result", "finalOutcome", "resolution"))),
+        "peopleInvolved": _people_out(_pick(raw, "peopleInvolved", "involvedPeople", "involvedPersons", "personsInvolved", "involved", "people")),
+        "report": _text(_pick(raw, "report", "incidentReport", "narrative", "reportDetails", "reportText", "details", "additionalDetails", "description", "summary", "notes", "remarks")),
+        "reportedBy": _person_name(_pick(raw, "reportedByName", "reportedBy", "submittedByName", "submittedBy", "responderName", "responder", "preparedBy", "author")),
+        "unit": unit_names[0] if unit_names else None,   # the unit of the responder who reported
+        "units": unit_names,                              # every unit on the incident
+        "submittedAt": _iso(_pick(raw, "submittedAt", "timeSubmitted", "submissionTime", "submittedOn", "dateSubmitted", "submitted", "reportedAt", "createdAt", "timestamp", "time")),
+    }
+    log.info("IncidentReport fields found: %s", sorted(str(k) for k in raw.keys()))
+    return out
+
+
+# Has the responder filled the report in? Asked once per report on the list, so remember the answer:
+# a filled report stays filled; an empty one is asked again after a short while.
+_IR_FILLED: set[str] = set()
+_IR_EMPTY_UNTIL: dict[str, float] = {}
+_IR_RECHECK_SECONDS = 20
+
+
+def _has_incident_report(ref: Any, report_id: str, data: dict[str, Any]) -> bool | None:
+    """True / False, or None when it could not be checked (then the page shows no tag rather than a wrong one)."""
+    if report_id in _IR_FILLED:
+        return True
+    if _IR_EMPTY_UNTIL.get(report_id, 0) > time.time():
+        return False
+    try:
+        found = _find_incident_report_raw(ref, data) is not None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not check the IncidentReport of %s: %s", report_id, exc)
+        return None
+    if found:
+        _IR_FILLED.add(report_id)
+    else:
+        _IR_EMPTY_UNTIL[report_id] = time.time() + _IR_RECHECK_SECONDS
+    return found
+
+
 def _history_item(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
     created_dt = _created_datetime(data)
+    threat_label, threat_level = _resolve_threat(data)
     return {
         "id": doc_id,
         "type": data.get("incidentType") or data.get("channelName") or "Unknown",
         "location": _location_to_string(data.get("location")),
         "time": _format_time(created_dt),
-        "threat": _normalize_threat(data.get("threatLevel")),
+        "threat": threat_label,
         "date": _history_label(created_dt),
         "status": data.get("status", "pending"),
         # True when the report actually ended; False when it was archived only
         # because a day passed. The History page's "Resolved" filter uses this.
         "ended": _has_ended(data),
         "createdAt": created_dt.isoformat() if created_dt else None,
-        "threatLevel": data.get("threatLevel"),
+        "threatLevel": threat_level,
         "resolvedAt": _iso(data.get("resolvedAt") or data.get("endedAt")),
         "resolvedBy": data.get("resolvedBy") or "",
         "resolvedById": data.get("resolvedById") or "",
@@ -253,10 +499,13 @@ def _history_item(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _history_detail(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
+def _history_detail(doc_id: str, data: dict[str, Any], incident_report: dict[str, Any] | None = None) -> dict[str, Any]:
     """The list item plus everything the report page needs to show a finished incident."""
     item = _history_item(doc_id, data)
     item.update({
+        # What the responder submitted (None until they do). createdAt, from the report itself, is on every item.
+        "incidentReport": incident_report,
+        "hasIncidentReport": incident_report is not None,
         "description": data.get("description") or data.get("incidentDescription") or "",
         "deployedUnits": data.get("deployedUnits") or [],
         "deployedResponders": data.get("deployedResponders") or [],
@@ -299,6 +548,7 @@ def get_history_reports(limit: int | None = None, station_id: str | None = Depen
     """
     db = get_db()
     entries: dict[str, tuple[datetime, dict[str, Any]]] = {}
+    sources: dict[str, tuple[Any, dict[str, Any]]] = {}   # report id -> (document ref, data), for the IncidentReport check
     oldest = datetime.min.replace(tzinfo=timezone.utc)
 
     for doc in db.collection("Emergencies").stream():
@@ -306,17 +556,30 @@ def get_history_reports(limit: int | None = None, station_id: str | None = Depen
         if not _matches_station(data, station_id):
             continue
         entries[doc.id] = (_created_datetime(data) or oldest, _history_item(doc.id, data))
+        sources[doc.id] = (doc.reference, data)
 
     for doc in route_unassigned(db, list(db.collection("ActiveCalls").stream())):
         data = doc.to_dict() or {}
         if not _is_archived(data) or not _matches_station(data, station_id):
             continue
         entries[doc.id] = (_created_datetime(data) or oldest, _history_item(doc.id, data))
+        sources[doc.id] = (doc.reference, data)
 
     ordered = sorted(entries.values(), key=lambda entry: entry[0], reverse=True)
     reports = [item for _, item in ordered]
     if limit:
         reports = reports[:limit]
+
+    # Has the responder submitted the IncidentReport? (Fake reports never get one, so they are not asked.)
+    def _check(item: dict[str, Any]) -> bool | None:
+        if item.get("threat") == "Fake" or item["id"] not in sources:
+            return None
+        ref, data = sources[item["id"]]
+        return _has_incident_report(ref, item["id"], data)
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        for item, filled in zip(reports, pool.map(_check, reports)):
+            item["hasIncidentReport"] = filled
 
     return {"reports": reports}
 
@@ -324,10 +587,23 @@ def get_history_reports(limit: int | None = None, station_id: str | None = Depen
 @router.get("/{report_id}")
 def get_history_report(report_id: str, station_id: str | None = Depends(get_station_scope)):
     """One finished report with its remarks, deployed units/responders and recorded video."""
-    data = _merged_report_data(get_db(), report_id)
+    db = get_db()
+    data = _merged_report_data(db, report_id)
     if not data or not _matches_station(data, station_id):
         raise HTTPException(status_code=404, detail="Report not found")
-    return _history_detail(report_id, data)
+
+    # The responder's IncidentReport: ActiveCalls first, then the legacy Emergencies copy.
+    raw = _find_incident_report_raw(None, data)
+    for collection in ("ActiveCalls", "Emergencies"):
+        if raw:
+            break
+        try:
+            raw = _find_incident_report_raw(db.collection(collection).document(report_id), None)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not read the IncidentReport of %s in %s: %s", report_id, collection, exc)
+    if raw:
+        _IR_FILLED.add(report_id)
+    return _history_detail(report_id, data, _incident_report_out(raw, db))
 
 
 MIN_REMARK_CHARS = 10
