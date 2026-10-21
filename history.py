@@ -28,6 +28,12 @@ def _to_dt(firestore_ts):
         return firestore_ts.ToDatetime(tzinfo=timezone.utc)
     if isinstance(firestore_ts, datetime):
         return firestore_ts if firestore_ts.tzinfo else firestore_ts.replace(tzinfo=timezone.utc)
+    if isinstance(firestore_ts, str):
+        try:
+            dt = datetime.fromisoformat(firestore_ts.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
     return None
 
 def _iso(value: Any) -> str | None:
@@ -474,6 +480,144 @@ def _has_incident_report(ref: Any, report_id: str, data: dict[str, Any]) -> bool
     return found
 
 
+HAZARD_COLLECTION = "Hazards"   # <- change if your hazards live elsewhere
+_HAZARD_IMG_WORDS = ("image", "photo", "picture", "snapshot", "evidence")
+
+
+def _sign_storage_path(path: str) -> str | None:
+    """Bucket path (e.g. hazard-evidence/x.png) -> short-lived signed URL."""
+    try:
+        from firebase_admin import storage
+        blob = storage.bucket(STORAGE_BUCKET).blob(path.lstrip("/"))
+        return blob.generate_signed_url(version="v4", expiration=timedelta(hours=2), method="GET")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not sign hazard evidence %s: %s", path, exc)
+        return None
+
+
+PEOPLE_COLLECTIONS = ("Accounts", "Users")   # <- change to where your user documents live
+
+
+def _person_label(db: Any, uid: Any) -> str:
+    """User id -> display name (falls back to the id if no profile is found)."""
+    uid = str(uid or "").strip()
+    if not uid:
+        return ""
+    for collection in PEOPLE_COLLECTIONS:
+        try:
+            snap = db.collection(collection).document(uid).get()
+            if snap.exists:
+                d = snap.to_dict() or {}
+                name = _pick(d, "fullName", "displayName", "name", "username")
+                if name:
+                    return str(name)
+        except Exception:  # noqa: BLE001
+            pass
+    return uid
+
+
+def _image_urls(data: dict[str, Any]) -> list[str]:
+    """Photo evidence on a hazard document (signed so private bucket links load in the browser)."""
+    urls: list[str] = []
+
+    def is_video(url: str) -> bool:
+        return url.lower().split("?")[0].endswith(VIDEO_EXTS)
+
+    def add(value: Any) -> None:
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("downloadUrl") or value.get("src")
+        if isinstance(value, str) and value.startswith(("http://", "https://")) and not is_video(value):
+            value = _sign_storage_url(value)
+            if value not in urls:
+                urls.append(value)
+
+    for key, value in data.items():
+        if any(w in key.lower() for w in _HAZARD_IMG_WORDS):
+            if isinstance(value, (list, tuple)):
+                for entry in value:
+                    add(entry)
+            else:
+                add(value)
+
+    # Evidence saved by the resolve flow: resolution.evidence[] with a bucket "path" (not a URL).
+    resolution = data.get("resolution") if isinstance(data.get("resolution"), dict) else {}
+    for entry in resolution.get("evidence") or []:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "")
+        kind = str(entry.get("contentType") or entry.get("type") or "")
+        if kind.startswith("video") or path.lower().endswith(VIDEO_EXTS):
+            continue
+        if entry.get("url") or entry.get("downloadUrl"):
+            add(entry)
+        elif path:
+            signed = _sign_storage_path(path)
+            if signed and signed not in urls:
+                urls.append(signed)
+    return urls
+
+
+def _hazard_in_scope(data: dict[str, Any], station_id: str | None) -> bool:
+    """Hazards may not be routed to a station; only filter when the hazard actually has one."""
+    if not station_id or not station_id.strip():
+        return True
+    hazard_station = _report_station_id(data)
+    return not hazard_station or hazard_station == station_id.strip()
+
+
+def _hazard_resolved_datetime(data: dict[str, Any]) -> datetime | None:
+    """When the hazard was resolved (that is the time History records for a hazard)."""
+    res = data.get("resolution") if isinstance(data.get("resolution"), dict) else {}
+    return _to_dt(data.get("resolvedAt") or data.get("endedAt") or res.get("resolvedAt"))
+
+
+def _hazard_item(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    created_dt = _created_datetime(data)
+    resolved_dt = _hazard_resolved_datetime(data)
+    when_dt = resolved_dt or created_dt   # History time = resolved time (created only if no resolved time exists)
+    return {
+        "id": doc_id,
+        "kind": "hazard",
+        "type": data.get("hazardType") or data.get("type") or data.get("title") or "Hazard",
+        "location": _location_to_string(data.get("location")),
+        "time": _format_time(when_dt),
+        "threat": _normalize_threat(data.get("severity") or data.get("threatLevel")),
+        "date": _history_label(when_dt),
+        "status": data.get("status", "resolved"),
+        "ended": True,
+        "createdAt": created_dt.isoformat() if created_dt else None,
+        "resolvedAt": resolved_dt.isoformat() if resolved_dt else None,
+        "resolvedBy": data.get("resolvedBy") or (data.get("resolution") or {}).get("resolvedBy") or "",
+        "haveRemarks": bool(data.get("haveRemarks")),
+        "remarks": _remarks_out(data),
+    }
+
+
+def _hazard_detail(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    db = get_db()
+    item = _hazard_item(doc_id, data)
+    res = data.get("resolution") if isinstance(data.get("resolution"), dict) else {}
+    reporter = data.get("reportedBy") or data.get("reporterName") or ""
+    if isinstance(reporter, dict):
+        reporter = reporter.get("name") or reporter.get("username") or ""
+    reporter = reporter or _person_label(db, data.get("reporterUuid"))
+
+    remarks = item.get("remarks") or {}
+    item.update({
+        "description": data.get("description") or data.get("details") or "",
+        "images": _image_urls(data),
+        "reportedBy": str(reporter),
+        "resolvedBy": _person_label(db, item.get("resolvedBy")),
+        "outcome": res.get("outcomeLabel") or res.get("outcome") or "",
+        "remarks": {
+            **remarks,
+            "additionalDetails": remarks.get("additionalDetails") or res.get("hazardDetails") or "",
+            "resolution": remarks.get("resolution") or res.get("resolutionNotes") or "",
+        },
+    })
+    return item
+
+
 def _history_item(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
     created_dt = _created_datetime(data)
     threat_label, threat_level = _resolve_threat(data)
@@ -565,6 +709,15 @@ def get_history_reports(limit: int | None = None, station_id: str | None = Depen
         entries[doc.id] = (_created_datetime(data) or oldest, _history_item(doc.id, data))
         sources[doc.id] = (doc.reference, data)
 
+    try:
+        for doc in db.collection(HAZARD_COLLECTION).stream():
+            data = doc.to_dict() or {}
+            if not _has_ended(data) or not _hazard_in_scope(data, station_id):
+                continue
+            entries[f"hazard:{doc.id}"] = (_hazard_resolved_datetime(data) or _created_datetime(data) or oldest, _hazard_item(doc.id, data))
+    except Exception as exc:  # noqa: BLE001 - hazards must never break the report history
+        log.exception("Could not load resolved hazards: %s", exc)
+
     ordered = sorted(entries.values(), key=lambda entry: entry[0], reverse=True)
     reports = [item for _, item in ordered]
     if limit:
@@ -572,7 +725,7 @@ def get_history_reports(limit: int | None = None, station_id: str | None = Depen
 
     # Has the responder submitted the IncidentReport? (Fake reports never get one, so they are not asked.)
     def _check(item: dict[str, Any]) -> bool | None:
-        if item.get("threat") == "Fake" or item["id"] not in sources:
+        if item.get("kind") == "hazard" or item.get("threat") == "Fake" or item["id"] not in sources:
             return None
         ref, data = sources[item["id"]]
         return _has_incident_report(ref, item["id"], data)
@@ -582,6 +735,18 @@ def get_history_reports(limit: int | None = None, station_id: str | None = Depen
             item["hasIncidentReport"] = filled
 
     return {"reports": reports}
+
+
+@router.get("/hazards/{hazard_id}")
+def get_history_hazard(hazard_id: str, station_id: str | None = Depends(get_station_scope)):
+    """One resolved hazard with its photo evidence and details."""
+    snap = get_db().collection(HAZARD_COLLECTION).document(hazard_id).get()
+    data = (snap.to_dict() or {}) if snap.exists else {}
+    if not data or not _hazard_in_scope(data, station_id):
+        raise HTTPException(status_code=404, detail="Hazard not found")
+    if not _has_ended(data):
+        raise HTTPException(status_code=409, detail="This hazard is not resolved yet.")
+    return _hazard_detail(hazard_id, data)
 
 
 @router.get("/{report_id}")

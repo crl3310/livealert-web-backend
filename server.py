@@ -49,10 +49,10 @@ async def log_requests(request: Request, call_next):
     print(f"Response status: {request.method} {request.url.path} -> {response.status_code}")
     return response
 
-ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
+#ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
 
 # Uncomment while developing locally:
-#ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
+ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
 
 app.add_middleware(
     CORSMiddleware,
