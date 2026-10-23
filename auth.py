@@ -16,12 +16,14 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from firebase_admin import auth as firebase_auth
 from google.api_core.exceptions import GoogleAPICallError
 from pydantic import BaseModel
 
 from config import FIREBASE_AUTH_URL, API_KEY
 from firebase import get_db
+from security import get_verified_token
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -439,6 +441,29 @@ def refresh_session(payload: RefreshRequest):
         "token": data.get("id_token"),
         "refreshToken": data.get("refresh_token"),
     }
+
+
+@router.post("/logout")
+def logout(token: dict = Depends(get_verified_token)):
+    """
+    Ends the caller's session server-side.
+
+    Revokes ALL of this user's Firebase refresh tokens. From that moment:
+      - /auth/refresh fails with 401, so the site can't silently renew.
+      - Any ID token that was issued before now is rejected by
+        security.verify_token (needs AUTH_CHECK_REVOKED on, which is the
+        default now), so pressing Back to a cached page can't call the API.
+
+    The frontend must still wipe its own copy of the tokens (see notes).
+    """
+    uid = token["uid"]
+    try:
+        firebase_auth.revoke_refresh_tokens(uid)
+    except Exception as exc:
+        print(f"[auth.logout] Could not revoke tokens for {uid}: {exc.__class__.__name__}: {exc}")
+        raise HTTPException(status_code=503, detail="Could not log out right now. Please try again.")
+
+    return {"status": "success", "message": "Logged out."}
 
 
 @router.post("/send-code")

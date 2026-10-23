@@ -19,9 +19,10 @@ from firebase_admin import auth as firebase_auth
 from firebase import get_db
 
 # Also ask Firebase whether the token was revoked (password reset, disabled
-# user, revokeRefreshTokens). Safer, but adds one network call per request.
-# Off by default; set AUTH_CHECK_REVOKED=1 to turn it on.
-CHECK_REVOKED = os.getenv("AUTH_CHECK_REVOKED", "0").lower() in {"1", "true", "yes", "on"}
+# user, revokeRefreshTokens). Adds one network call per request.
+# On by default so /auth/logout actually kills the session; set
+# AUTH_CHECK_REVOKED=0 to turn it off.
+CHECK_REVOKED = os.getenv("AUTH_CHECK_REVOKED", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def _unauthorized(detail: str) -> HTTPException:

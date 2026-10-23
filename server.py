@@ -49,6 +49,17 @@ async def log_requests(request: Request, call_next):
     print(f"Response status: {request.method} {request.url.path} -> {response.status_code}")
     return response
 
+@app.middleware("http")
+async def no_store_api_responses(request: Request, call_next):
+    """Stop browsers/proxies from caching API responses (e.g. a logged-in
+    dashboard payload being replayed after logout via the Back button)."""
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
 ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
 
 # Uncomment while developing locally:
