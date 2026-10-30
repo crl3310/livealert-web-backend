@@ -1,8 +1,11 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from google.api_core.exceptions import AlreadyExists
 
 from accounts import admin_only, super_admin_only
 from firebase import get_db
+from validation import CommanderName, DocIdPath, Latitude, Longitude, PatchModel, StationName, StrictModel
 
 try:
     # firebase_admin's Firestore client exposes GeoPoint here.
@@ -13,20 +16,20 @@ except ImportError:  # pragma: no cover - fallback if using google-cloud-firesto
 router = APIRouter(prefix="/stations", tags=["Stations"])
 
 
-class Location(BaseModel):
-    latitude: float
-    longitude: float
+class Location(StrictModel):
+    latitude: Latitude      # -90..90, never NaN/Infinity (those would reach GeoPoint)
+    longitude: Longitude    # -180..180
 
 
-class StationCreate(BaseModel):
-    stationName: str
-    commanderName: str = ""
+class StationCreate(StrictModel):
+    stationName: StationName
+    commanderName: CommanderName = ""
     location: Location
 
 
-class StationUpdate(BaseModel):
-    stationName: str | None = None
-    commanderName: str | None = None
+class StationUpdate(PatchModel):
+    stationName: StationName | None = None
+    commanderName: CommanderName | None = None
     location: Location | None = None
 
 
@@ -39,6 +42,11 @@ def _next_station_id(db) -> str:
             nums.append(int(doc.id[2:]))
     next_num = (max(nums) + 1) if nums else 1
     return f"ST{next_num:03d}"
+
+
+def _is_disabled(doc) -> bool:
+    """A "deleted" station is only flagged disabled; its document stays in Firestore."""
+    return (doc.to_dict() or {}).get("disabled") is True
 
 
 def _serialize_station(doc) -> dict:
@@ -68,20 +76,29 @@ def list_stations():
     """Frontend accounts page: station registry for dropdowns/filters."""
     db = get_db()
     docs = list(db.collection("Stations").stream())
-    stations = [_serialize_station(doc) for doc in docs]
+    stations = [_serialize_station(doc) for doc in docs if not _is_disabled(doc)]
     return {"stations": stations}
 
 
 @router.post("", status_code=201, dependencies=[Depends(super_admin_only)])
 def create_station(payload: StationCreate):
     db = get_db()
-    station_id = _next_station_id(db)
 
-    db.collection("Stations").document(station_id).set({
-        "stationName": payload.stationName,
-        "commanderName": payload.commanderName,
-        "Location": GeoPoint(payload.location.latitude, payload.location.longitude),
-    })
+    # create() fails if the document already exists, so two admins creating a
+    # station at the same moment can't silently overwrite each other (set() did).
+    for _ in range(5):
+        station_id = _next_station_id(db)
+        try:
+            db.collection("Stations").document(station_id).create({
+                "stationName": payload.stationName,
+                "commanderName": payload.commanderName,
+                "Location": GeoPoint(payload.location.latitude, payload.location.longitude),
+            })
+            break
+        except AlreadyExists:
+            continue
+    else:
+        raise HTTPException(status_code=503, detail="Could not allocate a station id. Please try again.")
 
     return {
         "id": station_id,
@@ -92,10 +109,11 @@ def create_station(payload: StationCreate):
 
 
 @router.patch("/{station_id}", dependencies=[Depends(super_admin_only)])
-def update_station(station_id: str, payload: StationUpdate):
+def update_station(station_id: DocIdPath, payload: StationUpdate):
     db = get_db()
     station_ref = db.collection("Stations").document(station_id)
-    if not station_ref.get().exists:
+    snapshot = station_ref.get()
+    if not snapshot.exists or _is_disabled(snapshot):
         raise HTTPException(status_code=404, detail="Station not found")
 
     update_data = {}
@@ -113,10 +131,14 @@ def update_station(station_id: str, payload: StationUpdate):
 
 
 @router.delete("/{station_id}", dependencies=[Depends(super_admin_only)])
-def delete_station(station_id: str):
+def delete_station(station_id: DocIdPath):
     db = get_db()
     station_ref = db.collection("Stations").document(station_id)
-    if not station_ref.get().exists:
+    snapshot = station_ref.get()
+    if not snapshot.exists or _is_disabled(snapshot):
         raise HTTPException(status_code=404, detail="Station not found")
-    station_ref.delete()
+
+    # Soft delete: nothing is removed. The station is flagged and then hidden.
+    # To bring one back, set disabled to false on its Stations document.
+    station_ref.set({"disabled": True, "disabledAt": datetime.now(timezone.utc)}, merge=True)
     return {"deleted": True, "stationId": station_id}

@@ -25,6 +25,8 @@ from stations import router as stations_router
 from units import router as units_router
 from hazard import router as hazard_router
 from maps_config import router as maps_config_router
+from validation import install_validation_handlers, BodySizeLimitMiddleware
+from chat import router as chat_router
 
 
 IS_PROD = os.getenv("ENVIRONMENT") == "production"
@@ -36,6 +38,9 @@ app = FastAPI(
     redoc_url=None if IS_PROD else "/redoc",
     openapi_url=None if IS_PROD else "/openapi.json",
 )
+
+# 422 responses that never echo submitted input (e.g. passwords) back to the client.
+install_validation_handlers(app)
 
 
 @app.middleware("http")
@@ -60,10 +65,13 @@ async def no_store_api_responses(request: Request, call_next):
     return response
 
 
-ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
+#ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
 
 # Uncomment while developing locally:
-#ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
+ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
+
+# Added BEFORE CORS so CORS wraps it: an oversized request gets a clean 413 the browser can read.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=256 * 1024)
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,7 +91,7 @@ app.include_router(stations_router,  prefix="/api/v1")
 app.include_router(units_router,     prefix="/api/v1")
 app.include_router(hazard_router, prefix="/api/v1")  # Hazards router
 app.include_router(maps_config_router, prefix="/api/v1")
-
+app.include_router(chat_router, prefix="/api/v1")
 
 @app.get("/")
 def root():

@@ -4,8 +4,10 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from statistics import median
 from typing import Any
 from urllib.parse import unquote, urlsplit
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -681,14 +683,106 @@ def _merged_report_data(db, report_id: str) -> dict[str, Any]:
     return merged
 
 
+# ---------------------------------------------------------------------------
+# Paging helpers for GET /history
+# ---------------------------------------------------------------------------
+MAX_PAGE_SIZE = 100
+
+
+def _level_key(item: dict[str, Any]) -> str:
+    """Same rule history.js getThreat() uses: 'fake', a level digit, or '0' for Unknown."""
+    label = str(item.get("threat") or item.get("threatLevel") or "Unknown").strip()
+    if label.lower() == "fake":
+        return "fake"
+    digits = re.search(r"\d+", label)
+    return digits.group(0) if digits else "0"
+
+
+# ---------------------------------------------------------------------------
+# Metric cards at the top of the History page
+# ---------------------------------------------------------------------------
+# "Today" and "this month" are calendar days in the station's own time zone (not UTC, not "last 24 hours").
+# Override with the LIVEALERT_TIMEZONE environment variable if the deployment is ever outside the Philippines.
+def _local_tz():
+    try:
+        return ZoneInfo(os.getenv("LIVEALERT_TIMEZONE", "Asia/Manila"))
+    except Exception:  # noqa: BLE001 - tzdata missing (some Windows installs): the Philippines is a fixed UTC+8
+        return timezone(timedelta(hours=8))
+
+
+def _history_metrics(tab: list[tuple[datetime, str, dict[str, Any]]], hazard: bool) -> dict[str, Any]:
+    """Numbers for the three cards. `tab` is every report of the open tab (not just the loaded page).
+
+    - today / month: calendar day / month in the station's time zone, counted by the day the report was CLOSED
+      (resolved time; for a report that only timed out, its created time).
+    - resolution: median minutes from created to resolved (the median, so one forgotten report can't skew it).
+      Fake reports are left out.
+    """
+    tz = _local_tz()
+    today = datetime.now(tz).date()
+    month_start = today.replace(day=1)
+
+    n_today = n_month = 0
+    durations: list[float] = []
+
+    for dt, _key, item in tab:
+        closed = _to_dt(item.get("resolvedAt")) or dt
+        if closed.year > 1:   # year 1 = "no usable date" placeholder
+            day = closed.astimezone(tz).date()
+            if day == today:
+                n_today += 1
+            if day >= month_start:
+                n_month += 1
+
+        created, resolved = _to_dt(item.get("createdAt")), _to_dt(item.get("resolvedAt"))
+        if created and resolved and resolved >= created and item.get("threat") != "Fake" and (hazard or item.get("ended")):
+            durations.append((resolved - created).total_seconds() / 60)
+
+    return {
+        "today": n_today,
+        "month": n_month,
+        "resolutionMinutes": round(median(durations), 1) if durations else None,
+    }
+
+
+def _cursor_of(dt: datetime, key: str) -> str:
+    return f"{dt.timestamp()!r}|{key}"
+
+
+def _parse_cursor(cursor: str | None) -> tuple[float, str] | None:
+    if not cursor:
+        return None
+    ts, sep, key = cursor.partition("|")
+    if not sep:
+        raise HTTPException(status_code=400, detail="Invalid cursor.")
+    try:
+        return float(ts), key
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid cursor.")
+
+
 @router.get("")
-def get_history_reports(limit: int | None = None, station_id: str | None = Depends(get_station_scope)):
+def get_history_reports(
+    limit: int | None = None,
+    kind: str | None = None,        # "emergency" | "hazard"  -> turns paging on
+    cursor: str | None = None,
+    q: str | None = None,
+    filter: str | None = None,      # all | 0..4 | fake | resolved
+    station_id: str | None = Depends(get_station_scope),
+):
     """Frontend history page: every incident that is no longer live, newest first.
 
     A report lands here once it has ended or a day has passed since it was
     created (see _is_archived). Reports still in the legacy Emergencies
     collection are included too so nothing that used to be in History vanishes;
     an ActiveCalls copy wins if the same id exists in both.
+
+    Paged mode is switched on by the `kind` query parameter:
+      GET /history?kind=emergency|hazard&limit=20&cursor=<token>&q=<text>&filter=all|0..4|fake|resolved
+      -> { "reports": [...up to limit...], "nextCursor": "<token>" | null,
+           "counts":  { "emergency": N, "hazard": N },
+           "metrics": see _history_metrics() } 
+    Without `kind` the answer is the old one: {"reports": [...]} (optionally cut to ?limit=N).
     """
     db = get_db()
     entries: dict[str, tuple[datetime, dict[str, Any]]] = {}
@@ -718,11 +812,6 @@ def get_history_reports(limit: int | None = None, station_id: str | None = Depen
     except Exception as exc:  # noqa: BLE001 - hazards must never break the report history
         log.exception("Could not load resolved hazards: %s", exc)
 
-    ordered = sorted(entries.values(), key=lambda entry: entry[0], reverse=True)
-    reports = [item for _, item in ordered]
-    if limit:
-        reports = reports[:limit]
-
     # Has the responder submitted the IncidentReport? (Fake reports never get one, so they are not asked.)
     def _check(item: dict[str, Any]) -> bool | None:
         if item.get("kind") == "hazard" or item.get("threat") == "Fake" or item["id"] not in sources:
@@ -730,11 +819,71 @@ def get_history_reports(limit: int | None = None, station_id: str | None = Depen
         ref, data = sources[item["id"]]
         return _has_incident_report(ref, item["id"], data)
 
-    with ThreadPoolExecutor(max_workers=12) as pool:
-        for item, filled in zip(reports, pool.map(_check, reports)):
-            item["hasIncidentReport"] = filled
+    def _attach_incident_flags(reports: list[dict[str, Any]]) -> None:
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            for item, filled in zip(reports, pool.map(_check, reports)):
+                item["hasIncidentReport"] = filled
 
-    return {"reports": reports}
+    # ----- Legacy (unpaged) answer: unchanged behaviour ---------------------
+    if kind is None:
+        ordered = sorted(entries.values(), key=lambda entry: entry[0], reverse=True)
+        reports = [item for _, item in ordered]
+        if limit:
+            reports = reports[:limit]
+        _attach_incident_flags(reports)
+        return {"reports": reports}
+
+    # ----- Paged answer ------------------------------------------------------
+    kind = kind.strip().lower()
+    if kind not in ("emergency", "hazard"):
+        raise HTTPException(status_code=422, detail="kind must be 'emergency' or 'hazard'.")
+    page_size = max(1, min(int(limit or 20), MAX_PAGE_SIZE))
+    after = _parse_cursor(cursor)
+
+    def _is_kind(item: dict[str, Any]) -> bool:
+        return (item.get("kind") == "hazard") == (kind == "hazard")
+
+    # Newest first; the key breaks ties so the order (and the cursor) is stable.
+    ordered = sorted(
+        ((dt, key, item) for key, (dt, item) in entries.items()),
+        key=lambda e: (e[0], e[1]),
+        reverse=True,
+    )
+
+    # Tab counts and the four metric cards describe the whole tab, ignoring search/filter.
+    counts = {
+        "emergency": sum(1 for _, _, i in ordered if i.get("kind") != "hazard"),
+        "hazard": sum(1 for _, _, i in ordered if i.get("kind") == "hazard"),
+    }
+    tab = [e for e in ordered if _is_kind(e[2])]
+    metrics = _history_metrics(tab, hazard=(kind == "hazard"))
+
+    # Search + level filter, on the lightweight list items (no per-report lookups yet).
+    query = (q or "").strip().lower()
+    level = (filter or "all").strip().lower()
+
+    def _passes(item: dict[str, Any]) -> bool:
+        if query and query not in str(item.get("type") or "").lower() and query not in str(item.get("location") or "").lower():
+            return False
+        if level == "all":
+            return True
+        if level == "resolved":
+            return bool(item.get("ended"))
+        return _level_key(item) == level
+
+    matching = [e for e in tab if _passes(e[2])]
+
+    # Everything strictly after the cursor, then one page of it.
+    if after is not None:
+        matching = [e for e in matching if (e[0].timestamp(), e[1]) < after]
+    page = matching[:page_size]
+    has_more = len(matching) > page_size
+
+    reports = [item for _, _, item in page]
+    _attach_incident_flags(reports)   # the slow part now only runs for these <= page_size reports
+
+    next_cursor = _cursor_of(page[-1][0], page[-1][1]) if has_more and page else None
+    return {"reports": reports, "nextCursor": next_cursor, "counts": counts, "metrics": metrics}
 
 
 @router.get("/hazards/{hazard_id}")

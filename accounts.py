@@ -1,14 +1,18 @@
 import re
 from datetime import datetime, timezone
 from math import atan2, cos, radians, sin, sqrt
-from typing import Any
+from typing import Any, ClassVar
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from firebase import get_db
 from security import get_verified_token
+from validation import (
+    ACCOUNT_STATUS_VALUES, BADGE_MESSAGE, DUTY_VALUES, ROLE_VALUES, AccountStatusValue, Badge, DocIdOrBlank,
+    DocIdPath, DutyValue, EmailAddress, OptionalDocId, PatchModel, PersonName, RoleValue, StrictModel,
+    clean_badge, require_choice,
+)
 
 router = APIRouter(prefix="/accounts", tags=["Accounts"])
 
@@ -94,6 +98,8 @@ def get_current_account(token: dict = Depends(get_verified_token)) -> dict:
         raise HTTPException(status_code=403, detail="No account profile for this login")
 
     data = snapshot.to_dict() or {}
+    if data.get("disabled") is True:   # "deleted" accounts are only flagged, see delete_account
+        raise HTTPException(status_code=403, detail="This account has been disabled.")
     return {
         "id": account_id,
         "collection": RESPONDERS,
@@ -204,6 +210,8 @@ def _on_duty_station_ids(db: Any) -> set[str]:
     ids: set[str] = set()
     for doc in db.collection("Responders").stream():
         d = doc.to_dict() or {}
+        if d.get("disabled") is True:
+            continue
         if str(d.get("role") or "").strip().lower() not in _CALL_ROLES:
             continue
         if str(d.get("duty") or "").strip().lower() != "on_duty":
@@ -238,6 +246,8 @@ def route_unassigned(db: Any, docs: list) -> list:
                 if s.id.strip().upper() not in on_duty_ids:
                     continue
                 sd = s.to_dict() or {}
+                if sd.get("disabled") is True:
+                    continue
                 sc = station_coords(sd)
                 if sc is not None:
                     stations.append((s.id, sd, sc))
@@ -335,34 +345,91 @@ except ImportError:  # pragma: no cover - firebase_admin should already be a
     firebase_auth = None  # project dependency; this only guards import order
 
 
-class AccountCreate(BaseModel):
-    firstName: str = ""
-    lastName: str = ""
-    badge: str = ""
-    email: str = ""
-    role: str = ""
-    stationId: str = ""
-    status: str = ""            # "on" / "off" / "inactive", as before
-    duty: str = "off_duty"      # shift state; new accounts start off shift
-    unitId: str | None = None
+# Badge numbers are the web login name, so they must be present, tidy and unique.
+def _clean_badge(raw: str | None) -> str:
+    """Trim, validate and UPPER-CASE a badge so PNP-123 and pnp-123 are one badge."""
+    try:
+        return clean_badge(raw or "")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=BADGE_MESSAGE)
+
+
+def _assert_station_exists(db, station_id: str | None) -> None:
+    """A station id coming from a request must point at a real, enabled station."""
+    if not station_id:
+        return
+    snap = db.collection("Stations").document(station_id).get()
+    if not snap.exists or (snap.to_dict() or {}).get("disabled") is True:
+        raise HTTPException(status_code=400, detail="That station does not exist.")
+
+
+def _assert_unit_in_station(db, unit_id: str | None, station_id: str | None) -> None:
+    """A unit id from a request must exist, be enabled, and belong to the account's station.
+    Without this an admin could put a responder on another station's unit."""
+    if not unit_id:
+        return
+    snap = db.collection("Units").document(unit_id).get()
+    unit = (snap.to_dict() or {}) if snap.exists else {}
+    if (not snap.exists or unit.get("disabled") is True
+            or str(unit.get("stationId") or "").strip() != str(station_id or "").strip()):
+        raise HTTPException(status_code=400, detail="That unit does not exist in this account's station.")
+
+
+def _assert_email_free(db, email: str, own_id: str | None = None) -> None:
+    snaps = db.collection(RESPONDERS).where("email", "==", email).limit(5).stream()
+    if any(d.id != own_id for d in snaps):
+        raise HTTPException(status_code=400, detail="Email already registered.")
+
+
+def _assert_badge_free(db, badge: str, own_id: str | None = None) -> None:
+    """
+    Refuses a badge that any OTHER account already has (every station, every
+    role, disabled accounts included). Looks for the upper-case form and the
+    lower-case form so an older account saved in lower case still counts.
+    own_id lets an account keep its own badge when it is edited.
+    """
+    variants = list({badge, badge.upper(), badge.lower()})
+    snaps = db.collection("Responders").where("badge", "in", variants).limit(5).stream()
+    if any(d.id != own_id for d in snaps):
+        raise HTTPException(status_code=400, detail="That badge number is already in use.")
+
+
+class AccountCreate(StrictModel):
+    firstName: PersonName = ""
+    lastName: PersonName = ""
+    badge: Badge = ""
+    email: EmailAddress = ""
+    role: RoleValue = ""
+    stationId: DocIdOrBlank = ""
+    status: AccountStatusValue = ""   # "on" / "off" / "inactive", as before
+    duty: DutyValue = "off_duty"      # shift state; new accounts start off shift
+    unitId: OptionalDocId = None
     is_new: bool = True
 
 
-class AccountUpdate(BaseModel):
-    firstName: str | None = None
-    lastName: str | None = None
-    badge: str | None = None
-    email: str | None = None
-    role: str | None = None
-    stationId: str | None = None
-    status: str | None = None
-    duty: str | None = None
-    unitId: str | None = None
+class AccountUpdate(PatchModel):
+    # unitId may be sent as null/"" to clear a unit; for every other field an
+    # explicit null means "not sent" (before, {"status": null} silently became "on").
+    nullable_fields: ClassVar[frozenset[str]] = frozenset({"unitId"})
+
+    firstName: PersonName | None = None
+    lastName: PersonName | None = None
+    badge: Badge | None = None
+    email: EmailAddress | None = None
+    role: RoleValue | None = None
+    stationId: DocIdOrBlank | None = None
+    status: AccountStatusValue | None = None
+    duty: DutyValue | None = None
+    unitId: OptionalDocId = None
     is_new: bool | None = None
 
 
-class DutyUpdate(BaseModel):
-    duty: str | None = None  # omit to flip whatever is currently stored
+class StatusUpdate(StrictModel):
+    status: AccountStatusValue
+
+
+class DutyUpdate(StrictModel):
+    duty: DutyValue | None = None  # omit to flip whatever is currently stored
 
 
 def _has_duty(role: str) -> bool:
@@ -552,9 +619,9 @@ def get_my_permissions(account: dict = Depends(get_current_account)):
 
 @router.get("")
 def list_accounts(
-    duty: str | None = None,
-    status: str | None = None,
-    role: str | None = None,
+    duty: str | None = Query(None, max_length=20),
+    status: str | None = Query(None, max_length=20),
+    role: str | None = Query(None, max_length=40),
     account: dict = Depends(get_current_account),
 ):
     """
@@ -569,6 +636,9 @@ def list_accounts(
     """
     db = get_db()
 
+    duty = require_choice(duty, DUTY_VALUES, "duty")
+    status = require_choice(status, ACCOUNT_STATUS_VALUES, "status")
+    role = require_choice(role, ROLE_VALUES, "role")
     duty_filter = _normalize_duty(duty) if duty else None
     status_filter = _normalize_status(status) if status else None
     role_filter = role.strip().lower() if role else None
@@ -581,6 +651,8 @@ def list_accounts(
 
     accounts = []
     for doc in db.collection(RESPONDERS).stream():
+        if (doc.to_dict() or {}).get("disabled") is True:
+            continue   # "deleted" accounts stay in the database but are hidden
         account = _serialize(doc.id, doc.to_dict() or {})
 
         if scope_active:
@@ -658,6 +730,9 @@ def create_account(payload: AccountCreate, account: dict = Depends(get_current_a
         raise HTTPException(status_code=400, detail="First and last name are required.")
     if not email:
         raise HTTPException(status_code=400, detail="Email is required.")
+    badge = _clean_badge(payload.badge)
+    _assert_station_exists(db, payload.stationId)
+    _assert_unit_in_station(db, payload.unitId, payload.stationId)
 
     # Same username rule the Accounts page has always used (first.last, lower-case,
     # no spaces); login-by-username depends on this field being present.
@@ -668,6 +743,7 @@ def create_account(payload: AccountCreate, account: dict = Depends(get_current_a
         raise HTTPException(status_code=400, detail="Username already exists.")
     if list(users.where("email", "==", email).limit(1).stream()):
         raise HTTPException(status_code=400, detail="Email already registered.")
+    _assert_badge_free(db, badge)
 
     try:
         user_record = firebase_auth.create_user(email=email, password=DEFAULT_RESPONDER_PASSWORD)
@@ -685,7 +761,7 @@ def create_account(payload: AccountCreate, account: dict = Depends(get_current_a
     account_data = {
         "firstName": first_name,
         "lastName": last_name,
-        "badge": payload.badge,
+        "badge": badge,
         "email": email,
         "role": requested_role,
         "stationId": payload.stationId,
@@ -717,7 +793,7 @@ def create_account(payload: AccountCreate, account: dict = Depends(get_current_a
 
 
 @router.patch("/{account_id}")
-def update_account(account_id: str, payload: AccountUpdate, account: dict = Depends(get_current_account)):
+def update_account(account_id: DocIdPath, payload: AccountUpdate, account: dict = Depends(get_current_account)):
     db = get_db()
     ref, snapshot = _find_account(db, account_id)
     existing = snapshot.to_dict() or {}
@@ -759,6 +835,20 @@ def update_account(account_id: str, payload: AccountUpdate, account: dict = Depe
     ):
         _require_super_admin_caller(db, account["id"])
 
+    if "badge" in data:
+        data["badge"] = _clean_badge(data["badge"])
+        _assert_badge_free(db, data["badge"], own_id=account_id)
+    if "email" in data:
+        _assert_email_free(db, data["email"], own_id=account_id)
+
+    # Ids from the request must point at real things, and the unit must sit in
+    # the account's (new) station.
+    target_station = str(data.get("stationId", existing.get("stationId")) or "").strip()
+    if data.get("stationId"):
+        _assert_station_exists(db, data["stationId"])
+    if data.get("unitId"):
+        _assert_unit_in_station(db, data["unitId"], target_station)
+
     # Normalize before writing so an admin UI sending "On Duty" or a mobile
     # client sending "on" can't put an unrecognized string into Firestore.
     if "status" in data:
@@ -793,7 +883,7 @@ def update_account(account_id: str, payload: AccountUpdate, account: dict = Depe
 
 
 @router.patch("/{account_id}/duty")
-def set_duty(account_id: str, payload: DutyUpdate, account: dict = Depends(get_current_account)):
+def set_duty(account_id: DocIdPath, payload: DutyUpdate, account: dict = Depends(get_current_account)):
     """
     Shift toggle. Send {"duty": "on_duty"} / {"duty": "off_duty"} to set an
     explicit state, or an empty body to flip whatever is currently stored.
@@ -843,7 +933,7 @@ def set_duty(account_id: str, payload: DutyUpdate, account: dict = Depends(get_c
 
 
 @router.patch("/{account_id}/status")
-def set_status(account_id: str, payload: AccountUpdate, account: dict = Depends(get_current_account)):
+def set_status(account_id: DocIdPath, payload: StatusUpdate, account: dict = Depends(get_current_account)):
     """
     Set account status. Send {"status": "on"}, {"status": "off"}, or
     {"status": "inactive"} — same values the Accounts admin UI has always
@@ -852,9 +942,6 @@ def set_status(account_id: str, payload: AccountUpdate, account: dict = Depends(
     Deactivating a responder (status "inactive") force-ends any open shift,
     so a disabled account can't be left sitting in the on-duty roster.
     """
-    if payload.status is None:
-        raise HTTPException(status_code=422, detail="status is required")
-
     db = get_db()
     ref, snapshot = _find_account(db, account_id)
     existing = snapshot.to_dict() or {}
@@ -879,7 +966,7 @@ def set_status(account_id: str, payload: AccountUpdate, account: dict = Depends(
 
 
 @router.post("/{account_id}/reset-password")
-def reset_password(account_id: str, account: dict = Depends(get_current_account)):
+def reset_password(account_id: DocIdPath, account: dict = Depends(get_current_account)):
     """
     Resets an account's login password back to the same default new accounts
     get (see DEFAULT_RESPONDER_PASSWORD) and re-arms is_new so they're forced
@@ -901,7 +988,8 @@ def reset_password(account_id: str, account: dict = Depends(get_current_account)
         # Covers firebase_admin.auth.UserNotFoundError (doc exists in
         # Firestore but has no matching Auth credential — e.g. a manually
         # seeded record) and any other Admin SDK failure.
-        raise HTTPException(status_code=502, detail=f"Could not reset password: {err}")
+        print(f"[accounts.reset_password] {err.__class__.__name__}: {err}")  # keep details server-side
+        raise HTTPException(status_code=502, detail="Could not reset the password for this account.")
 
     ref.set({"is_new": True}, merge=True)
 
@@ -909,10 +997,14 @@ def reset_password(account_id: str, account: dict = Depends(get_current_account)
 
 
 @router.delete("/{account_id}")
-def delete_account(account_id: str, account: dict = Depends(get_current_account)):
+def delete_account(account_id: DocIdPath, account: dict = Depends(get_current_account)):
     db = get_db()
     _require_super_admin(db, account["id"], "revoke accounts")
     ref, _ = _find_account(db, account_id)
-    ref.delete()
+
+    # Soft delete: nothing is removed. The account is flagged, then hidden from
+    # the roster and refused by get_current_account. To bring one back, set
+    # disabled to false on its Responders document.
+    ref.set({"disabled": True, "disabledAt": datetime.now(timezone.utc)}, merge=True)
 
     return {"deleted": True, "accountId": account_id, "collection": RESPONDERS}

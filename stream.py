@@ -13,12 +13,16 @@ Endpoints:
     GET  /api/v1/stream/live-updates            — real-time SSE database stream
 """
 
+import html as _html
+import os
+import secrets
 import uuid
 import time
 import asyncio
 import json
 from datetime import datetime, timezone
 from math import radians, sin, cos, sqrt, atan2
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -28,8 +32,52 @@ from accounts import get_station_scope, require_page, route_unassigned
 from security import get_verified_token
 from config import AGORA_APP_ID, AGORA_APP_CERTIFICATE
 from firebase import get_db
+from validation import ChannelIdPath, DocIdPath
 
 router = APIRouter(prefix="/stream", tags=["Stream"])
+
+# ── Safe HTML pages ───────────────────────────────────────────────────────────
+# The broadcaster/viewer pages are built from a template. Anything dropped into
+# it is escaped for the place it lands (HTML text vs. a JavaScript string), and
+# the response carries a Content-Security-Policy so that even a missed spot
+# can't run injected script.
+#   STREAM_CSP_REPORT_ONLY=1   log violations in the browser console instead of blocking
+#                              (use this first, then switch it off once the pages work)
+#   STREAM_FRAME_ANCESTORS     e.g. "https://dashboard.example.com" if the pages are embedded
+CSP_REPORT_ONLY = os.getenv("STREAM_CSP_REPORT_ONLY", "0").lower() in {"1", "true", "yes", "on"}
+FRAME_ANCESTORS = os.getenv("STREAM_FRAME_ANCESTORS", "").strip()
+
+
+def _js(value) -> str:
+    """A value as a JavaScript literal that is safe inside an inline <script>."""
+    return (json.dumps(str(value))
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
+
+def _page(content: str, nonce: str) -> HTMLResponse:
+    directives = [
+        "default-src 'self'",
+        f"script-src 'nonce-{nonce}' https://download.agora.io",
+        f"style-src 'nonce-{nonce}'",
+        "style-src-attr 'unsafe-inline'",
+        "connect-src 'self' https: wss:",   # Agora signalling/media hosts vary by region
+        "img-src 'self' data: blob:",
+        "media-src 'self' blob:",
+        "worker-src 'self' blob:",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'none'",
+    ]
+    if FRAME_ANCESTORS:
+        directives.append(f"frame-ancestors {FRAME_ANCESTORS}")
+    header = "Content-Security-Policy-Report-Only" if CSP_REPORT_ONLY else "Content-Security-Policy"
+    return HTMLResponse(content=content, headers={
+        header: "; ".join(directives),
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+        "Cache-Control": "no-store",
+    })
 
 
 def _to_dt(firestore_ts):
@@ -178,7 +226,7 @@ async def live_updates(station_id: str = Depends(get_station_scope)):
 
 @router.post("/create/{emergency_id}")
 def create_stream(
-    emergency_id: str,
+    emergency_id: DocIdPath,
     station_id: str = Depends(get_station_scope),
     _: dict = Depends(require_page("dashboard")),
 ):
@@ -201,15 +249,15 @@ def create_stream(
         "emergencyId": emergency_id,
         "channelId": channel_id,
         "agoraAppId": AGORA_APP_ID,
-        "joinUrl": f"/api/v1/stream/join/{channel_id}",
-        "viewUrl": f"/api/v1/stream/view/{channel_id}",
+        "joinUrl": f"/api/v1/stream/join/{quote(channel_id, safe='')}",
+        "viewUrl": f"/api/v1/stream/view/{quote(channel_id, safe='')}",
     }
 
 
 # ── Get Token ─────────────────────────────────────────────────────────────────
 
 @router.get("/token/{channel_id}")
-def get_stream_token(channel_id: str, _: dict = Depends(get_verified_token)):
+def get_stream_token(channel_id: ChannelIdPath, _: dict = Depends(get_verified_token)):
     """Get a dynamic token for joining an Agora channel."""
     try:
         token = _generate_agora_token(channel_id)
@@ -220,14 +268,19 @@ def get_stream_token(channel_id: str, _: dict = Depends(get_verified_token)):
             "uid": 0,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Token generation failed: {str(e)}")
+        print(f"[stream.get_stream_token] {e.__class__.__name__}: {e}")  # keep details server-side
+        raise HTTPException(status_code=500, detail="Token generation failed.")
 
 
 # ── Broadcaster Page ──────────────────────────────────────────────────────────
 
 @router.get("/join/{channel_id}", response_class=HTMLResponse)
-def join_stream(channel_id: str):
+def join_stream(channel_id: ChannelIdPath):
     """Opens a live stream page for the broadcaster."""
+    nonce = secrets.token_urlsafe(16)
+    channel_html = _html.escape(channel_id, quote=True)
+    channel_js = _js(channel_id)
+    app_id_js = _js(AGORA_APP_ID)
     html = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -235,7 +288,7 @@ def join_stream(channel_id: str):
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>LiveAlert — Agora Broadcast</title>
-  <style>
+  <style nonce="{nonce}">
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
     body {{ background: #111; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }}
     h2 {{ color: #e53e3e; margin-bottom: 8px; }}
@@ -250,14 +303,14 @@ def join_stream(channel_id: str):
 <body>
   <span class="badge">⬤ LIVE</span>
   <h2>LiveAlert — Broadcasting</h2>
-  <p>Channel: <strong>{channel_id}</strong></p>
+  <p>Channel: <strong>{channel_html}</strong></p>
   <video id="local-video" autoplay playsinline muted></video>
-  <button onclick="startBroadcast()">Start Broadcasting</button>
+  <button id="start-btn">Start Broadcasting</button>
   <div id="status">Waiting to start...</div>
-  <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.23.2.js"></script>
-  <script>
-    const channelName = "{channel_id}";
-    const appId = "{AGORA_APP_ID}";
+  <script nonce="{nonce}" src="https://download.agora.io/sdk/release/AgoraRTC_N-4.23.2.js"></script>
+  <script nonce="{nonce}">
+    const channelName = {channel_js};
+    const appId = {app_id_js};
     let client;
     let localTracks = {{ audioTrack: null, videoTrack: null }};
 
@@ -304,17 +357,22 @@ def join_stream(channel_id: str):
         status("Error: " + err.message);
       }}
     }}
+    document.getElementById("start-btn").addEventListener("click", startBroadcast);
   </script>
 </body>
 </html>"""
-    return HTMLResponse(content=html)
+    return _page(html, nonce)
 
 
 # ── Viewer Page ───────────────────────────────────────────────────────────────
 
 @router.get("/view/{channel_id}", response_class=HTMLResponse)
-def view_stream(channel_id: str):
+def view_stream(channel_id: ChannelIdPath):
     """View-only live stream page."""
+    nonce = secrets.token_urlsafe(16)
+    channel_html = _html.escape(channel_id, quote=True)
+    channel_js = _js(channel_id)
+    app_id_js = _js(AGORA_APP_ID)
     html = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -322,7 +380,7 @@ def view_stream(channel_id: str):
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>LiveAlert — Agora Viewing</title>
-  <style>
+  <style nonce="{nonce}">
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
     body {{ background: #111; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; }}
     h2 {{ color: #e53e3e; margin-bottom: 8px; }}
@@ -335,13 +393,13 @@ def view_stream(channel_id: str):
 <body>
   <span class="badge">⬤ LIVE</span>
   <h2>LiveAlert — Viewing</h2>
-  <p>Channel: <strong>{channel_id}</strong></p>
+  <p>Channel: <strong>{channel_html}</strong></p>
   <video id="remote-video" autoplay playsinline></video>
   <div id="status">Connecting to stream...</div>
-  <script src="https://download.agora.io/sdk/release/AgoraRTC_N-4.23.2.js"></script>
-  <script>
-    const channelName = "{channel_id}";
-    const appId = "{AGORA_APP_ID}";
+  <script nonce="{nonce}" src="https://download.agora.io/sdk/release/AgoraRTC_N-4.23.2.js"></script>
+  <script nonce="{nonce}">
+    const channelName = {channel_js};
+    const appId = {app_id_js};
     let client;
 
     function status(message) {{
@@ -387,13 +445,13 @@ def view_stream(channel_id: str):
   </script>
 </body>
 </html>"""
-    return HTMLResponse(content=html)
+    return _page(html, nonce)
 
 
 # ── Report Summary ────────────────────────────────────────────────────────────
 
 @router.get("/{emergency_id}/summary")
-def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_station_scope)):
+def get_report_summary(emergency_id: DocIdPath, station_id: str | None = Depends(get_station_scope)):
     """
     Full Report Summary for 'View Report' page:
       - Description + severity level (as stored on the call)
@@ -527,8 +585,8 @@ def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_s
         "unitId": unit_id,
         "unitName": _get_unit_name(db, unit_id),
         "streamChannelId": channel_id,
-        "viewUrl": f"/api/v1/stream/view/{channel_id}" if channel_id else None,
-        "joinUrl": f"/api/v1/stream/join/{channel_id}" if channel_id else None,
+        "viewUrl": f"/api/v1/stream/view/{quote(channel_id, safe='')}" if channel_id else None,
+        "joinUrl": f"/api/v1/stream/join/{quote(channel_id, safe='')}" if channel_id else None,
         "agoraAppId": AGORA_APP_ID,
         "token": _generate_agora_token(channel_id) if channel_id else None,
         "createdAt": _to_dt(data.get("timestamp") or data.get("createdAt")),
@@ -560,6 +618,8 @@ def _cached_name(db, collection: str, doc_id: str | None, build) -> str | None:
             name = build(snap.to_dict() or {})
     except Exception:
         pass
+    if len(_NAME_CACHE) > 2000:   # keys come from stored data; don't let the cache grow forever
+        _NAME_CACHE.clear()
     _NAME_CACHE[key] = (now, name)
     return name
 
@@ -578,7 +638,7 @@ def _point_from(value):
 
 
 @router.get("/{emergency_id}/responders")
-def get_responder_locations(emergency_id: str, station_id: str | None = Depends(get_station_scope)):
+def get_responder_locations(emergency_id: DocIdPath, station_id: str | None = Depends(get_station_scope)):
     """Live positions of the units responding to this emergency."""
     db = get_db()
     snap = db.collection("ActiveCalls").document(emergency_id).get()
@@ -616,3 +676,139 @@ def get_responder_locations(emergency_id: str, station_id: str | None = Depends(
             })
 
     return {"responders": responders, "count": len(responders)}
+
+# ── Reporter's live location ──────────────────────────────────────────────────
+# The reporter's phone keeps ActiveCalls/{id}.location up to date while the call is live.
+# It can be a GeoPoint or a map ({latitude, longitude} / {lat, lng} / {coordinates: ...}) that may also carry
+# accuracy, heading, speed and updatedAt. When the field is missing or has no usable point, the answer is
+# {"available": false}: the website simply shows nothing.
+#
+#   GET /api/v1/stream/{emergency_id}/user-location          one answer (first load / fallback)
+#   GET /api/v1/stream/{emergency_id}/user-location/stream   live: a new event every time the position changes
+#
+# Same station rule as the summary and responders endpoints: other stations' calls answer 404.
+
+USER_LOCATION_KEEPALIVE_SECONDS = 25
+
+
+def _num(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None   # not NaN / infinity
+
+
+def _user_location_payload(data: dict) -> dict:
+    # The live position is now the "location" field. "userLocation" is only read as a fallback for older
+    # calls that still carry it and have no usable "location".
+    raw, lat, lng = None, None, None
+    for key in ("location", "userLocation"):
+        candidate = data.get(key)
+        c_lat, c_lng = _point_from(candidate)
+        if (c_lat is None or c_lng is None) and isinstance(candidate, dict):
+            c_lat, c_lng = _point_from(candidate.get("coordinates"))
+        c_lat, c_lng = _num(c_lat), _num(c_lng)
+        if c_lat is not None and c_lng is not None and abs(c_lat) <= 90 and abs(c_lng) <= 180 \
+                and not (c_lat == 0 and c_lng == 0):
+            raw, lat, lng = candidate, c_lat, c_lng
+            break
+
+    usable = (
+        lat is not None and lng is not None
+        and abs(lat) <= 90 and abs(lng) <= 180
+        and not (lat == 0 and lng == 0)          # 0,0 means "no fix yet", not a place
+    )
+    if not usable:
+        return {"available": False}
+
+    extra = raw if isinstance(raw, dict) else {}
+    updated = _to_dt(extra.get("updatedAt") or extra.get("timestamp") or data.get("locationUpdatedAt") or data.get("userLocationUpdatedAt"))
+    return {
+        "available": True,
+        "lat": lat,
+        "lng": lng,
+        "accuracy": _num(extra.get("accuracy")),
+        "heading": _num(extra.get("heading")),
+        "speed": _num(extra.get("speed")),
+        "updatedAt": updated.isoformat() if updated else None,
+    }
+
+
+def _owns_call(data: dict, station_id: str | None) -> bool:
+    if not station_id:
+        return True
+    assigned = data.get("assignedStation") or {}
+    return str(data.get("nearestStationId") or assigned.get("stationId") or "").strip() == station_id
+
+
+def _load_scoped_call(emergency_id: str, station_id: str | None):
+    ref = get_db().collection("ActiveCalls").document(emergency_id)
+    snap = ref.get()
+    data = snap.to_dict() if snap.exists else None
+    if not data or not _owns_call(data, station_id):
+        raise HTTPException(status_code=404, detail="Active call not found")
+    return ref, data
+
+
+@router.get("/{emergency_id}/user-location")
+def get_user_location(emergency_id: DocIdPath, station_id: str | None = Depends(get_station_scope)):
+    """The reporter's last known position for this call (one answer)."""
+    _ref, data = _load_scoped_call(emergency_id, station_id)
+    return _user_location_payload(data)
+
+
+@router.get("/{emergency_id}/user-location/stream")
+async def user_location_stream(emergency_id: DocIdPath, station_id: str | None = Depends(get_station_scope)):
+    """
+    Server-Sent Events: the reporter's position, pushed the moment it changes.
+    The first event is the current position; after that, one event per real change (the call document also
+    changes for other reasons, those are ignored). The stream ends if the call stops being this station's.
+    """
+    loop = asyncio.get_running_loop()
+    call_ref, _data = await loop.run_in_executor(None, _load_scoped_call, emergency_id, station_id)
+
+    queue: asyncio.Queue = asyncio.Queue()
+    last = {"sig": None}
+
+    def doc_callback(doc_snapshots, changes, read_time):
+        # Firestore calls this from its own thread, not the event loop.
+        for snap in doc_snapshots:
+            data = snap.to_dict() or {}
+            if not _owns_call(data, station_id):
+                loop.call_soon_threadsafe(queue.put_nowait, None)   # moved to another station: end the stream
+                return
+            payload = _user_location_payload(data)
+            sig = (payload.get("available"), payload.get("lat"), payload.get("lng"), payload.get("updatedAt"))
+            if sig == last["sig"]:
+                continue
+            last["sig"] = sig
+            loop.call_soon_threadsafe(queue.put_nowait, payload)
+
+    watch = call_ref.on_snapshot(doc_callback)
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=USER_LOCATION_KEEPALIVE_SECONDS)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"   # stops proxies from closing an idle connection
+                    continue
+                if item is None:
+                    break
+                yield f"data: {json.dumps(item, default=str)}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            watch.unsubscribe()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

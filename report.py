@@ -1,8 +1,11 @@
 from datetime import datetime, timedelta, timezone
-from typing import Any
+import math
+import os
+import re
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import Field
 
 from accounts import get_station_scope, require_page, route_unassigned
 from firebase import get_db
@@ -11,6 +14,10 @@ from history import (
     _remarks_out, _resolve_threat, _video_urls,
 )
 from units import _on_duty_responders
+from validation import (
+    Description, DocIdOrBlank, DocIdPath, DocIdStr, IncidentType, OptionalDocId, PatchModel,
+    ReportLevelValue, ReportStatusValue, ShortLabel, StrictModel,
+)
 
 try:
     from google.cloud import firestore  # type: ignore
@@ -18,6 +25,10 @@ except ImportError:  # pragma: no cover - depends on which SDK the project uses
     from firebase_admin import firestore  # type: ignore
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
+
+# forward-options?debug=true dumps internals (every station's free units, field names).
+# Off unless the server is started with API_DEBUG_OUTPUT=1.
+ALLOW_DEBUG_OUTPUT = os.getenv("API_DEBUG_OUTPUT", "0").lower() in {"1", "true", "yes", "on"}
 
 def _created_datetime(data: dict[str, Any]) -> datetime | None:
     return _to_dt(data.get("timestamp") or data.get("createdAt"))
@@ -54,23 +65,38 @@ def _matches_station(data: dict[str, Any], station_id: str | None) -> bool:
 
 
 
-class ResponderSnapshot(BaseModel):
-    id: str = ""
-    name: str = ""
-    unitName: str = ""
+class ResponderSnapshot(StrictModel):
+    id: DocIdOrBlank = ""
+    name: ShortLabel = ""
+    unitName: ShortLabel = ""
 
 
-class ReportUpdate(BaseModel):
-    status: str | None = None
-    level: str | None = None
-    incidentType: str | None = None
-    description: str | None = None
-    nearestStationId: str | None = None
-    unitIds: list[str] | None = None  # full list of assigned units (replaces existing; [] unassigns all)
+class ForwardRequest(StrictModel):
+    # The station the admin was looking at when they pressed Forward. If the report has
+    # moved or changed since, the request is rejected (409) instead of forwarding twice.
+    fromStationId: OptionalDocId = None
+    # The station the admin picked from the list. Omitted = the nearest one that has a free unit.
+    toStationId: OptionalDocId = None
+
+
+# Caps stop one request from fanning out into hundreds of Firestore reads/writes.
+MAX_UNITS_PER_REPORT = 20
+MAX_RESPONDER_SNAPSHOTS = 50
+
+
+class ReportUpdate(PatchModel):
+    # Explicit nulls count as "not sent" (PatchModel). Before, {"unitIds": null} unassigned every unit.
+    status: ReportStatusValue | None = None
+    level: ReportLevelValue | None = None
+    incidentType: IncidentType | None = None
+    description: Description | None = None
+    nearestStationId: DocIdStr | None = None
+    # full list of assigned units (replaces existing; [] unassigns all)
+    unitIds: Annotated[list[DocIdStr], Field(max_length=MAX_UNITS_PER_REPORT)] | None = None
     # Sent by End Dispatch together with status="resolved"; only stored on that first transition.
-    resolvedBy: str | None = None
-    resolvedById: str | None = None
-    deployedResponders: list[ResponderSnapshot] | None = None
+    resolvedBy: ShortLabel | None = None
+    resolvedById: DocIdOrBlank | None = None
+    deployedResponders: Annotated[list[ResponderSnapshot], Field(max_length=MAX_RESPONDER_SNAPSHOTS)] | None = None
 
 
 def _to_dt(firestore_ts):
@@ -250,6 +276,12 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media
         "status": data.get("status", "pending"),
         "aiSummary": data.get("ai_summary"),
         "aiReasoning": data.get("ai_reasoning"),
+        # AI verdict fields, passed through exactly as stored so the frontend (LiveAlertAI.getConfidence /
+        # isFlaggedFake) can read them. Do NOT use `or` fallbacks here: a confidence of 0 is a real value.
+        "aiEmergencyConfidence": data.get("aiEmergencyConfidence"),
+        "aiFlaggedFake": data.get("aiFlaggedFake") is True,
+        "aiMode": data.get("aiMode"),
+        "aiAssessment": data.get("ai_assessment"),
         "nearestStationId": data.get("nearestStationId") or assigned_station.get("stationId", ""),
         # Alias of nearestStationId under the name the frontend's unit-assignment
         # dropdown (report.js) actually reads, so a report can be filtered down
@@ -277,11 +309,225 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media
         "haveRemarks": bool(data.get("haveRemarks")),
         "remarks": _remarks_out(data),
         "deployedUnits": data.get("deployedUnits") or [],
+        # Set when another station passed this report on (from the last forwardHistory entry).
+        "forwardedFrom": _forward_out(data),
         "deployedResponders": data.get("deployedResponders") or [],
         "incidentReport": incident_report,
         "videoUrls": _video_urls(data, sign=sign_media),
         "evidenceUploadedAt": data.get("evidence_uploaded_at") and _to_dt(data.get("evidence_uploaded_at")) and _to_dt(data.get("evidence_uploaded_at")).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Forward a report to the next nearest station
+# ---------------------------------------------------------------------------
+# The Forward option exists only while the station that received the report has AT MOST this many
+# free units left (a free unit = active, has a responder on duty, and is not already on another
+# live emergency). 1 = "last unit" or "none left". Set it to 0 to forward only when nothing is left.
+FORWARD_WHEN_AT_MOST_UNITS = 1
+
+# A station can RECEIVE a forwarded report only when it has MORE free units than the limit above, so it would not
+# immediately be a "last unit" station itself. Otherwise the report could bounce between stations in a loop.
+# With the limit at 1 this means 2 or more free units.
+FORWARD_MIN_FREE_UNITS_TO_RECEIVE = FORWARD_WHEN_AT_MOST_UNITS + 1
+
+_FORWARD_REASONS = {
+    "ended": "This report has already ended.",
+    "no_station": "This report has no station yet.",
+    "unit_assigned": "A unit is already assigned to this report.",
+    "not_last_unit": "This station still has enough free units, so it can't be forwarded.",
+    "no_location": "Can't find the next station: no location for the report or station.",
+    "no_station_available": "No other station has enough free units right now.",
+}
+
+
+_COORD_TEXT = re.compile(r"^\s*(-?\d{1,3}(?:\.\d+)?)\s*[,;\s]\s*(-?\d{1,3}(?:\.\d+)?)\s*$")
+_REPORT_POINT_KEYS = ("location", "coordinates", "geo", "position", "geoPoint", "gps", "reporterLocation",
+                      "userLocation", "currentLocation", "lastKnownLocation", "incidentLocation", "locationRaw")
+
+
+def _first(obj: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if obj.get(key) is not None:
+            return obj[key]
+    return None
+
+
+def _coords(obj: Any) -> tuple[float, float] | None:
+    """Lat/lng out of whatever the app stored: a GeoPoint, "14.49, 121.05" text, {coordinates: [lng, lat]},
+    or a dict using lat/latitude/_latitude and lng/lon/long/longitude/_longitude."""
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        m = _COORD_TEXT.match(obj)
+        if not m:
+            return None
+        lat, lng = m.group(1), m.group(2)
+    elif hasattr(obj, "latitude") and hasattr(obj, "longitude"):
+        lat, lng = obj.latitude, obj.longitude
+    elif isinstance(obj, dict):
+        pair = obj.get("coordinates")
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+            lng, lat = pair[0], pair[1]
+        else:
+            lat = _first(obj, ("lat", "latitude", "_latitude"))
+            lng = _first(obj, ("lng", "lon", "long", "longitude", "_longitude"))
+    else:
+        return None
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+    if (lat == 0 and lng == 0) or abs(lat) > 90 or abs(lng) > 180:
+        return None
+    return lat, lng
+
+
+def _report_origin(data: dict[str, Any]) -> tuple[float, float] | None:
+    """Where the incident is: top-level lat/lng first, then any of the places a report may carry a position."""
+    found = _coords(data)
+    if found:
+        return found
+    for key in _REPORT_POINT_KEYS:
+        found = _coords(data.get(key))
+        if found:
+            return found
+    return None
+
+
+# The Stations collection stores the point as "Location" (capital L); the summary endpoint in stream.py reads it
+# the same way. Reading only "location" left every station without a position, so every distance was unknown.
+_STATION_POINT_KEYS = ("Location", "location", "stationLocation", "coordinates", "geo", "position", "geoPoint")
+
+
+def _station_point(st: dict[str, Any]) -> Any:
+    """The raw location value a station carries, whichever spelling it uses."""
+    for key in _STATION_POINT_KEYS:
+        if st.get(key) is not None and _coords(st.get(key)):
+            return st[key]
+    return None
+
+
+def _station_spot(st: dict[str, Any]) -> tuple[float, float] | None:
+    return _coords(_station_point(st)) or _coords(st)
+
+
+def _distance_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    rad = math.radians
+    d_lat, d_lng = rad(b[0] - a[0]), rad(b[1] - a[1])
+    h = math.sin(d_lat / 2) ** 2 + math.cos(rad(a[0])) * math.cos(rad(b[0])) * math.sin(d_lng / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(h))
+
+
+def _busy_unit_ids(db: Any, exclude_report_id: str) -> set[str]:
+    """Units already committed to some OTHER live emergency."""
+    busy: set[str] = set()
+    for doc in db.collection("ActiveCalls").stream():
+        if doc.id == exclude_report_id:
+            continue
+        data = doc.to_dict() or {}
+        if _is_archived(data) or _has_ended(data):   # finished reports no longer tie up their units
+            continue
+        busy.update(_extract_unit_ids(data))
+    return busy
+
+
+def _free_units_by_station(db: Any, busy: set[str]) -> dict[str, list[str]]:
+    """{stationId: [unit ids that can take a report right now]}.
+    Same availability rule as the Units page / assign modal (active + a responder on duty),
+    minus units that are already out on another emergency."""
+    on_duty = {r["unitId"] for r in _on_duty_responders(db) if r.get("unitId")}
+    free: dict[str, list[str]] = {}
+    for unit_doc in db.collection("Units").stream():
+        unit = unit_doc.to_dict() or {}
+        station = unit.get("stationId")
+        if not station or unit.get("status", "on") != "on":
+            continue
+        if unit_doc.id not in on_duty or unit_doc.id in busy:
+            continue
+        free.setdefault(station, []).append(unit_doc.id)
+    return free
+
+
+def _forward_options(db: Any, report_id: str, data: dict[str, Any], debug: bool = False) -> dict[str, Any]:
+    current = _report_station_id(data)
+    out: dict[str, Any] = {
+        "canForward": False, "remainingUnits": 0, "currentStationId": current,
+        "nextStation": None, "reason": None, "minFreeUnits": FORWARD_MIN_FREE_UNITS_TO_RECEIVE,
+    }
+
+    def no(reason: str) -> dict[str, Any]:
+        out["reason"] = reason
+        return out
+
+    if _has_ended(data):
+        return no("ended")
+    if not current:
+        return no("no_station")
+    if _extract_unit_ids(data):          # someone is already on the way: too late to forward
+        return no("unit_assigned")
+
+    busy = _busy_unit_ids(db, report_id)
+    free = _free_units_by_station(db, busy)
+    if debug:
+        out["debug"] = {"busyUnitIds": sorted(busy), "freeUnitsByStationId": free}
+    out["remainingUnits"] = len(free.get(current, []))
+    if out["remainingUnits"] > FORWARD_WHEN_AT_MOST_UNITS:
+        return no("not_last_unit")
+
+    # Never bounce a report back to a station it already came from / was forwarded to.
+    tried = {current}
+    for hop in data.get("forwardHistory") or []:
+        if isinstance(hop, dict):
+            tried.update(s for s in (hop.get("fromStationId"), hop.get("toStationId")) if s)
+
+    origin = _report_origin(data)
+    stations = {s.id: (s.to_dict() or {}) for s in db.collection("Stations").stream()}
+    if origin is None:   # no incident coordinates: measure from the current station instead
+        origin = _station_spot(stations.get(current, {}))
+
+    # Every other station: ones that can take the report first (nearest at the top), then greyed-out ones.
+    # A station with disabled: true is closed and is not listed at all. An enabled station without enough free
+    # units (FORWARD_MIN_FREE_UNITS_TO_RECEIVE) is listed greyed out; one whose distance can't be worked out
+    # (no coordinates) goes at the bottom.
+    rows: list[dict[str, Any]] = []
+    for sid, st in stations.items():
+        if sid in tried:
+            continue
+        if st.get("disabled") is True:      # closed station (Stations.disabled): never shown; update_report refuses it too
+            continue
+        spot = _station_spot(st)
+        dist = round(_distance_km(origin, spot), 1) if origin and spot else None
+        n_free = len(free.get(sid, []))
+        rows.append({"id": sid, "name": st.get("stationName") or sid, "distanceKm": dist,
+                     "availableUnits": n_free, "available": n_free >= FORWARD_MIN_FREE_UNITS_TO_RECEIVE})
+    # Stations that can take the report come first, nearest at the very top; greyed-out ones (no free unit) go below.
+    rows.sort(key=lambda r: (not r["available"], r["distanceKm"] is None, r["distanceKm"] or 0, r["name"]))
+    out["stations"] = rows
+
+    if debug:
+        out.setdefault("debug", {}).update({
+            "origin": origin, "stationCount": len(stations), "alreadyTried": sorted(tried),
+            "stationFields": {sid: sorted(st.keys()) for sid, st in stations.items()},
+        })
+
+    nearest = next((r for r in rows if r["available"]), None)
+    if nearest is None:
+        return no("no_station_available")
+    out["canForward"] = True
+    out["nextStation"] = nearest
+    return out
+
+
+def _forward_out(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Which station relayed this report to us: the last entry of forwardHistory (the only thing stored)."""
+    hops = [h for h in (data.get("forwardHistory") or []) if isinstance(h, dict)]
+    if not hops:
+        return None
+    hop = hops[-1]
+    at = _to_dt(hop.get("at"))
+    return {"stationId": hop.get("fromStationId", ""), "stationName": hop.get("fromStationName", ""),
+            "at": at.isoformat() if at else None}
 
 
 @router.get("/recent")
@@ -310,8 +556,84 @@ def get_recent_reports(station_id: str | None = Depends(get_station_scope)):
     return {"reports": reports}
 
 
+@router.get("/{report_id}/forward-options")
+def get_forward_options(report_id: DocIdPath, debug: bool = False, station_id: str | None = Depends(get_station_scope)):
+    """Should this report show a Forward button, and to which station? Computed server-side so the
+    page doesn't need to see other stations' units."""
+    db = get_db()
+    doc = db.collection("ActiveCalls").document(report_id).get()
+    if not doc.exists or not _matches_station(doc.to_dict() or {}, station_id):
+        raise HTTPException(status_code=404, detail="Report not found")
+    return _forward_options(db, report_id, doc.to_dict() or {}, debug=debug and ALLOW_DEBUG_OUTPUT)
+
+
+@router.post("/{report_id}/forward")
+def forward_report(
+    report_id: DocIdPath,
+    body: ForwardRequest = ForwardRequest(),
+    station_id: str | None = Depends(get_station_scope),
+    user: dict = Depends(require_page("report")),
+):
+    """Hand the report to the next nearest station that has enough free units. That station then owns it."""
+    db = get_db()
+    ref = db.collection("ActiveCalls").document(report_id)
+    doc = ref.get()
+    existing = doc.to_dict() or {}
+    if not doc.exists or not _matches_station(existing, station_id):
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    current = _report_station_id(existing)
+    if body.fromStationId and body.fromStationId.strip() != current:
+        raise HTTPException(status_code=409, detail="This report was already moved to another station.")
+
+    # Re-check everything now; the button may be stale (a unit came back on duty, was assigned, ...).
+    options = _forward_options(db, report_id, existing)
+    if not options["canForward"]:
+        raise HTTPException(status_code=409, detail=_FORWARD_REASONS.get(options["reason"], "This report can't be forwarded right now."))
+
+    chosen = options["nextStation"]
+    if body.toStationId:
+        chosen = next((r for r in options.get("stations", []) if r["id"] == body.toStationId), None)
+        if chosen is None:
+            raise HTTPException(status_code=400, detail="That station can't receive this report.")
+        if not chosen["available"]:
+            raise HTTPException(status_code=409, detail=f"That station needs at least {FORWARD_MIN_FREE_UNITS_TO_RECEIVE} free units to receive this report.")
+    target_id = chosen["id"]
+    target_doc = db.collection("Stations").document(target_id).get()
+    target = target_doc.to_dict() or {}
+    now = datetime.now(timezone.utc)
+    old_assigned = existing.get("assignedStation") or {}
+    from_name = old_assigned.get("stationName") or existing.get("stationName") or current
+
+    # Rebuild assignedStation for the new station (read-merge-write, so unrelated keys such as
+    # dispatchStatus survive) and start with no units: the new station picks its own.
+    assigned = dict(old_assigned)
+    assigned.update({"stationId": target_id, "stationName": target.get("stationName") or target_id, "unitIds": []})
+    assigned.pop("unitId", None)
+    if target.get("commanderName"):
+        assigned["commanderName"] = target["commanderName"]
+    else:
+        assigned.pop("commanderName", None)
+        assigned.pop("commandName", None)
+    target_point = _station_point(target)
+    if target_point is not None:
+        assigned["location"] = target_point
+
+    hop = {
+        "fromStationId": current, "fromStationName": from_name,
+        "toStationId": target_id, "toStationName": assigned["stationName"],
+        "at": now, "by": str(user.get("id") or user.get("uid") or user.get("email") or ""),
+    }
+    ref.update({
+        "nearestStationId": target_id,
+        "assignedStation": assigned,
+        "forwardHistory": firestore.ArrayUnion([hop]),
+    })
+    return {"forwarded": True, "reportId": report_id, "toStation": chosen}
+
+
 @router.get("/{report_id}")
-def get_report_detail(report_id: str, station_id: str | None = Depends(get_station_scope)):
+def get_report_detail(report_id: DocIdPath, station_id: str | None = Depends(get_station_scope)):
     """Frontend report detail page."""
     db = get_db()
     doc = db.collection("ActiveCalls").document(report_id).get()
@@ -331,7 +653,7 @@ def get_report_detail(report_id: str, station_id: str | None = Depends(get_stati
 
 @router.patch("/{report_id}")
 def update_report(
-    report_id: str,
+    report_id: DocIdPath,
     payload: ReportUpdate,
     station_id: str | None = Depends(get_station_scope),
     _: dict = Depends(require_page("report")),
@@ -346,6 +668,13 @@ def update_report(
     existing_data = doc.to_dict() or {}
     if not _matches_station(existing_data, station_id):
         raise HTTPException(status_code=404, detail="Report not found")
+
+    # A report can only be routed to a station that exists and is enabled; otherwise
+    # it would vanish from every station's list.
+    if data.get("nearestStationId"):
+        target = db.collection("Stations").document(data["nearestStationId"]).get()
+        if not target.exists or (target.to_dict() or {}).get("disabled") is True:
+            raise HTTPException(status_code=400, detail="That station does not exist.")
 
     # Stamp when a report actually ended, server-side, the first time status
     # crosses into ENDED_STATUSES (e.g. via the "End Dispatch" button) — never

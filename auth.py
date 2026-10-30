@@ -19,11 +19,15 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from firebase_admin import auth as firebase_auth
 from google.api_core.exceptions import GoogleAPICallError
-from pydantic import BaseModel
 
 from config import FIREBASE_AUTH_URL, API_KEY
 from firebase import get_db
 from security import get_verified_token
+from validation import (
+    IdTokenStr, LoginIdentifier, LoginPassword, NewPassword, RefreshTokenStr, StrictModel, is_valid_badge,
+)
+
+MAX_LOGIN_BODY_BYTES = 8 * 1024
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -48,6 +52,17 @@ LOGIN_LOCKOUT_SEC = 15 * 60         # how long a locked key stays blocked
 # control (nginx, Cloudflare, ...). X-Forwarded-For is trivially spoofable
 # otherwise, which would let an attacker dodge the per-IP limit.
 TRUST_PROXY_HEADERS = os.getenv("LOGIN_TRUST_PROXY", "0").lower() in {"1", "true", "yes", "on"}
+
+# Admins now sign in with their BADGE NUMBER (sent in the same JSON field the
+# page always used, "usernameOrEmail"). Email login is switched off by default.
+# Set LOGIN_ALLOW_EMAIL=1 only if something (e.g. the mobile app) still signs in
+# with an email through this endpoint while you migrate it.
+ALLOW_EMAIL_LOGIN = os.getenv("LOGIN_ALLOW_EMAIL", "0").lower() in {"1", "true", "yes", "on"}
+
+# The ONE error every failed login gets, whether the badge doesn't exist, the
+# password is wrong, or the account has no email. Same status + same text means
+# nobody can probe which badge numbers are real.
+_GENERIC_BAD_LOGIN = "INVALID_LOGIN_CREDENTIALS"
 
 # Firebase error codes that mean "these credentials are wrong".
 _BAD_CREDENTIAL_CODES = ("INVALID_PASSWORD", "EMAIL_NOT_FOUND", "INVALID_LOGIN_CREDENTIALS")
@@ -161,14 +176,19 @@ def _raise_firestore_unavailable(exc: Exception) -> None:
 DEFAULT_RESPONDER_PASSWORD = "default123"
 
 
-class LoginRequest(BaseModel):
-    usernameOrEmail: str
-    password: str
+class LoginRequest(StrictModel):
+    usernameOrEmail: LoginIdentifier   # bounded, no control characters; shape is checked in login()
+    password: LoginPassword            # 1-1024 chars, never stripped
 
 
-class ChangePasswordRequest(BaseModel):
-    idToken: str
-    newPassword: str
+class ChangePasswordRequest(StrictModel):
+    idToken: IdTokenStr
+    newPassword: NewPassword
+
+
+class CodeRequest(StrictModel):
+    email: LoginIdentifier | None = None
+    usernameOrEmail: LoginIdentifier | None = None
 
 
 def _firebase_auth_request(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -190,7 +210,9 @@ def _firebase_auth_request(endpoint: str, payload: dict[str, Any]) -> dict[str, 
             message = "Firebase Auth request failed."
         raise HTTPException(status_code=400, detail=message)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        # str(exc) can contain internals (hostnames, request URLs); log it, don't send it.
+        print(f"[auth._firebase_auth_request] {endpoint}: {exc.__class__.__name__}: {exc}")
+        raise HTTPException(status_code=503, detail="Authentication service is unavailable. Please try again.")
 
 
 def _find_user_by_username_or_email(value: str) -> dict[str, Any] | None:
@@ -202,6 +224,24 @@ def _find_user_by_username_or_email(value: str) -> dict[str, Any] | None:
     if matches:
         return {"id": matches[0].id, **(matches[0].to_dict() or {})}
     matches = list(users.where("email", "==", value).limit(1).stream())
+    if matches:
+        return {"id": matches[0].id, **(matches[0].to_dict() or {})}
+    return None
+
+
+def _find_user_by_badge(badge: str) -> dict[str, Any] | None:
+    """
+    Exact-match lookup of an account by badge number. Returns None when there
+    is no match, AND when more than one account shares the badge (a data
+    problem: refusing is safer than guessing which account was meant).
+    """
+    # Badges are saved in upper case, so "pnp-40921" typed by hand still finds
+    # PNP-40921 (the typed form is tried too, for any older lower-case badge).
+    candidates = list({badge, badge.upper()})
+    matches = list(get_db().collection("Responders").where("badge", "in", candidates).limit(2).stream())
+    if len(matches) > 1:
+        print("[auth.login] More than one account shares a badge number; refusing login. Fix the duplicate in Responders.")
+        return None
     if matches:
         return {"id": matches[0].id, **(matches[0].to_dict() or {})}
     return None
@@ -240,39 +280,58 @@ def _create_responder_for_user(user_id: str, username: str | None, email: str) -
 
 @router.post("/login")
 async def login(request: Request, payload: LoginRequest | None = Body(default=None)):
-    """Authenticate a user with username or email and password."""
+    """Authenticate an admin with badge number and password."""
     if payload is None:
         try:
             raw = await request.body()
+            if len(raw) > MAX_LOGIN_BODY_BYTES:
+                raise ValueError("body too large")
             data = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(data, dict):
+                raise ValueError("body must be an object")
+            payload = LoginRequest(**data)
         except Exception:
-            raise HTTPException(status_code=400, detail="Request body must be valid JSON")
-        payload = LoginRequest(**data)
+            # Covers bad JSON, wrong shape and failed validation alike (a raw
+            # ValidationError here used to escape as a 500), and never echoes input.
+            raise HTTPException(status_code=400, detail="Request body must be valid JSON with usernameOrEmail and password.")
 
     # Brute-force protection: refuse before doing any work if this IP or
     # account is locked out.
-    limit_keys = _login_limit_keys(request, payload.usernameOrEmail)
+    identifier = payload.usernameOrEmail.strip()
+    limit_keys = _login_limit_keys(request, identifier)
     _enforce_login_limits(limit_keys)
 
-    email = payload.usernameOrEmail
-    if "@" not in email:
-        try:
-            user = _find_user_by_username_or_email(payload.usernameOrEmail)
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _raise_firestore_unavailable(exc)
-        if user is None or "email" not in user:
-            _record_login_failure(limit_keys)
-            raise HTTPException(status_code=404, detail="User not found.")
-        email = user["email"]
+    # Resolve the badge number to the account's email on the SERVER. The email
+    # is only ever used to talk to Firebase; it is never sent back to the browser.
+    user = None
+    email = None
+    try:
+        if "@" in identifier:
+            if ALLOW_EMAIL_LOGIN:
+                user = _find_user_by_username_or_email(identifier)
+                email = identifier
+        elif is_valid_badge(identifier):
+            user = _find_user_by_badge(identifier)
+            email = (user or {}).get("email") or None
+        # Anything else (wrong shape) falls through to the generic failure below,
+        # so it is indistinguishable from a wrong password and still rate-limited.
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_firestore_unavailable(exc)
 
-        # Also track by the resolved email, so alternating between username
-        # and email for the same account can't dodge the counter.
-        email_key = (f"acct:{email.strip().lower()}", LOGIN_MAX_FAILS_PER_ACCOUNT)
-        if email_key not in limit_keys:
-            limit_keys.append(email_key)
-            _enforce_login_limits([email_key])
+    if not email:
+        # Unknown badge, no email on file, or email login switched off: answer
+        # exactly like a wrong password.
+        _record_login_failure(limit_keys)
+        raise HTTPException(status_code=400, detail=_GENERIC_BAD_LOGIN)
+
+    # Also track by the resolved email, so alternating between badge and
+    # email for the same account can't dodge the counter.
+    email_key = (f"acct:{email.strip().lower()}", LOGIN_MAX_FAILS_PER_ACCOUNT)
+    if email_key not in limit_keys:
+        limit_keys.append(email_key)
+        _enforce_login_limits([email_key])
 
     try:
         auth_data = _firebase_auth_request("signInWithPassword", {
@@ -284,6 +343,9 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
         detail = str(exc.detail)
         if detail.startswith(_BAD_CREDENTIAL_CODES):
             _record_login_failure(limit_keys)
+            # Older Firebase projects answer INVALID_PASSWORD vs EMAIL_NOT_FOUND;
+            # collapse them so the answer never says which part was wrong.
+            raise HTTPException(status_code=400, detail=_GENERIC_BAD_LOGIN) from exc
         elif detail.startswith("TOO_MANY_ATTEMPTS_TRY_LATER"):
             # Firebase's own throttle kicked in; pass that on as a proper 429.
             raise HTTPException(
@@ -304,8 +366,7 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
         # otherwise genuinely valid. Worst case, a stale is_new gets caught by
         # a later page load's own profile check instead of right here.
         try:
-            user_doc = _find_user_by_username_or_email(payload.usernameOrEmail)
-            username = user_doc.get("username") if user_doc else None
+            username = user.get("username") if user else None
 
             # Only one collection now, so this is a straightforward existence
             # check: bootstrap a plain-responder doc only if this account has
@@ -328,10 +389,10 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
     return {
         "status": "success",
         "message": "Authentication successful.",
+        # No email / displayName here on purpose: the browser only needs the id
+        # and is_new. (The profile chip gets name + role from /accounts/me.)
         "user": {
             "id": auth_user_id,
-            "email": auth_data.get("email"),
-            "displayName": auth_data.get("displayName"),
             "is_new": is_new,
         },
         "token": auth_data.get("idToken"),
@@ -405,8 +466,8 @@ async def change_password(payload: ChangePasswordRequest):
     }
 
 
-class RefreshRequest(BaseModel):
-    refreshToken: str
+class RefreshRequest(StrictModel):
+    refreshToken: RefreshTokenStr
 
 
 @router.post("/refresh")
@@ -467,9 +528,9 @@ def logout(token: dict = Depends(get_verified_token)):
 
 
 @router.post("/send-code")
-def send_code(payload: dict = Body(...)):
+def send_code(payload: CodeRequest):
     """Mock sending a verification code for passwordless or MFA flows."""
-    email = payload.get("email") or payload.get("usernameOrEmail")
+    email = payload.email or payload.usernameOrEmail
     if not email:
         raise HTTPException(status_code=400, detail="Email address is required")
 
@@ -482,9 +543,11 @@ def send_code(payload: dict = Body(...)):
 
 
 @router.post("/verify-code")
-def verify_code(payload: dict = Body(...)):
-    """Mock verification endpoint without code validation."""
-    email = payload.get("email") or payload.get("usernameOrEmail")
+def verify_code(payload: CodeRequest):
+    """Mock verification endpoint without code validation.
+    SECURITY: this always reports success. Do not let anything trust it, and
+    remove it (or make it real) before production."""
+    email = payload.email or payload.usernameOrEmail
     if not email:
         raise HTTPException(status_code=400, detail="Email address is required")
 
