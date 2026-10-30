@@ -65,10 +65,10 @@ async def no_store_api_responses(request: Request, call_next):
     return response
 
 
-#ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
+ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
 
 # Uncomment while developing locally:
-ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
+#ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
 
 # Added BEFORE CORS so CORS wraps it: an oversized request gets a clean 413 the browser can read.
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=256 * 1024)
