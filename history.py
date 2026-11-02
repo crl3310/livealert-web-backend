@@ -162,10 +162,17 @@ def _resolve_threat(data: dict[str, Any]) -> tuple[str, Any]:
     """(label to show, raw threatLevel to send) for a report."""
     if _ai_rejected(data):
         return "Fake", None
+    # threatLevel (or severity/threat) literally set to "fake" -> Fake, never Unknown / Level 0
+    if any(str(data.get(k) or "").strip().lower() == "fake" for k in ("threatLevel", "threat", "severity")):
+        return "Fake", None
     if not _has_real_ai(data) or _ai_inconclusive(data):
         return "Unknown", None
     level = data.get("threatLevel")
-    return _normalize_threat(level), level
+    label = _normalize_threat(level)
+    # Level 0 means the AI could not tell how serious it is -> Unknown (never Fake; Fake is only for AI-rejected / cancelled_fake)
+    if re.fullmatch(r"(level\s*)?0+", label.strip(), re.IGNORECASE):
+        return "Unknown", None
+    return label, level
 
 
 def _format_time(created_dt: datetime | None) -> str:
@@ -497,25 +504,47 @@ def _sign_storage_path(path: str) -> str | None:
         return None
 
 
-PEOPLE_COLLECTIONS = ("Accounts", "Users")   # <- change to where your user documents live
+PEOPLE_COLLECTIONS = ("Users", "Responders", "Accounts")   # where user / responder documents live
+_ID_FIELDS = ("uid", "uuid", "userId", "id")                # fields that may hold the id if it is not the document id
+
+
+def _looks_like_id(value: Any) -> bool:
+    """True for a raw user id (UUID or Firebase uid) - never something to show as a name."""
+    s = str(value or "").strip()
+    return bool(re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s)
+                or re.fullmatch(r"[A-Za-z0-9_-]{20,}", s))
 
 
 def _person_label(db: Any, uid: Any) -> str:
-    """User id -> display name (falls back to the id if no profile is found)."""
+    """User id -> display name. Returns "" (not the id) when no profile is found."""
     uid = str(uid or "").strip()
     if not uid:
         return ""
+    def _name_of(d: dict[str, Any]) -> str:
+        name = _pick(d, "fullName", "displayName", "name", "username")
+        if not name:
+            first = _pick(d, "firstName", "givenName")
+            last = _pick(d, "lastName", "surname", "familyName")
+            name = " ".join(str(p) for p in (first, last) if p)
+        return str(name or "").strip()
+
     for collection in PEOPLE_COLLECTIONS:
         try:
+            # 1) the document id is the user id
             snap = db.collection(collection).document(uid).get()
             if snap.exists:
-                d = snap.to_dict() or {}
-                name = _pick(d, "fullName", "displayName", "name", "username")
+                name = _name_of(snap.to_dict() or {})
                 if name:
-                    return str(name)
-        except Exception:  # noqa: BLE001
-            pass
-    return uid
+                    return name
+            # 2) the user id is stored in a field of the document
+            for field in _ID_FIELDS:
+                for doc in db.collection(collection).where(field, "==", uid).limit(1).stream():
+                    name = _name_of(doc.to_dict() or {})
+                    if name:
+                        return name
+        except Exception as exc:  # noqa: BLE001
+            print(f"[history] person lookup failed in {collection}: {exc}")
+    return "" if _looks_like_id(uid) else uid   # it was already a name, or an id we can't resolve
 
 
 def _image_urls(data: dict[str, Any]) -> list[str]:
@@ -602,6 +631,8 @@ def _hazard_detail(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
     reporter = data.get("reportedBy") or data.get("reporterName") or ""
     if isinstance(reporter, dict):
         reporter = reporter.get("name") or reporter.get("username") or ""
+    if reporter and _looks_like_id(reporter):      # reportedBy holds an id, not a name
+        reporter = _person_label(db, reporter)
     reporter = reporter or _person_label(db, data.get("reporterUuid"))
 
     remarks = item.get("remarks") or {}
@@ -609,7 +640,7 @@ def _hazard_detail(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
         "description": data.get("description") or data.get("details") or "",
         "images": _image_urls(data),
         "reportedBy": str(reporter),
-        "resolvedBy": _person_label(db, item.get("resolvedBy")),
+        "resolvedBy": _person_label(db, item.get("resolvedBy") or data.get("resolvedById") or res.get("resolvedById")),
         "outcome": res.get("outcomeLabel") or res.get("outcome") or "",
         "remarks": {
             **remarks,
@@ -618,6 +649,16 @@ def _hazard_detail(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
         },
     })
     return item
+
+
+def _report_status(data: dict[str, Any]) -> str | None:
+    """The report's reportStatus, lower-cased: "pending" (responder has not submitted yet) or "submitted". None if the field is missing."""
+    value = data.get("reportStatus")
+    if value is None:
+        embedded = _find_incident_report_raw(None, data)
+        value = embedded.get("reportStatus") if isinstance(embedded, dict) else None
+    text = str(value or "").strip().lower()
+    return text or None
 
 
 def _history_item(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -640,7 +681,8 @@ def _history_item(doc_id: str, data: dict[str, Any]) -> dict[str, Any]:
         "resolvedBy": data.get("resolvedBy") or "",
         "resolvedById": data.get("resolvedById") or "",
         # Remarks: False until an admin writes them (or if they chose "later").
-        "haveRemarks": bool(data.get("haveRemarks")),
+        "haveRemarks": bool(data.get("haveRemarks")) or _report_status(data) == "submitted",
+        "reportStatus": _report_status(data),
         "remarks": _remarks_out(data),
     }
 
@@ -816,7 +858,12 @@ def get_history_reports(
     def _check(item: dict[str, Any]) -> bool | None:
         if item.get("kind") == "hazard" or item.get("threat") == "Fake" or item["id"] not in sources:
             return None
-        ref, data = sources[item["id"]]
+        status = item.get("reportStatus")
+        if status == "submitted":      # reportStatus decides first: submitted = has remarks
+            return True
+        if status == "pending":        # pending = no remarks yet
+            return False
+        ref, data = sources[item["id"]]   # no reportStatus on this report: look for the IncidentReport itself
         return _has_incident_report(ref, item["id"], data)
 
     def _attach_incident_flags(reports: list[dict[str, Any]]) -> None:
