@@ -100,6 +100,7 @@ def get_current_account(token: dict = Depends(get_verified_token)) -> dict:
     data = snapshot.to_dict() or {}
     if data.get("disabled") is True:   # "deleted" accounts are only flagged, see delete_account
         raise HTTPException(status_code=403, detail="This account has been disabled.")
+    _touch_admin_session(snapshot.reference, data)
     return {
         "id": account_id,
         "collection": RESPONDERS,
@@ -215,6 +216,8 @@ def _on_duty_station_ids(db: Any) -> set[str]:
         if str(d.get("role") or "").strip().lower() not in _CALL_ROLES:
             continue
         if str(d.get("duty") or "").strip().lower() != "on_duty":
+            continue
+        if not admin_session_is_live(d):   # on_duty but not seen recently = abandoned session
             continue
         sid = str(d.get("stationId") or "").strip().upper()
         if sid:
@@ -432,13 +435,106 @@ class DutyUpdate(StrictModel):
     duty: DutyValue | None = None  # omit to flip whatever is currently stored
 
 
+# Admin-level roles are put on duty automatically when they log in to the web
+# dashboard and off duty when they log out (done in auth.py's login/logout via
+# set_admin_duty below). That is how the report-assignment logic knows which
+# admins in a station can receive a report.
+ADMIN_DUTY_ROLES = {"responder_admin", "super_admin"}
+
+
 def _has_duty(role: str) -> bool:
     """
-    Only plain field responders track a duty/shift state — super_admin and
-    responder_admin accounts don't go on/off shift. A blank role defaults to
-    Responder, matching the list endpoint's fallback.
+    Every account that can be on shift tracks a duty state: plain field
+    responders (toggled from the mobile app) and admins (toggled by web
+    login/logout). A blank role defaults to Responder, matching the list
+    endpoint's fallback.
     """
-    return (role or "Responder").strip().lower() == "responder"
+    normalized = (role or "Responder").strip().lower()
+    return normalized == "responder" or normalized in ADMIN_DUTY_ROLES
+
+
+# An admin who closes the tab, loses power or whose 24h browser session lapses
+# never calls /auth/logout, so "on_duty" alone can't be trusted. Every
+# authenticated request records lastSeenAt (at most once a minute), and an admin
+# only counts as available while that is recent. The dashboard's normal polling
+# keeps it fresh, so the frontend needs no separate heartbeat.
+SESSION_TOUCH_SECONDS = 60
+SESSION_STALE_SECONDS = 180
+
+
+def _is_admin_role(role) -> bool:
+    return str(role or "").strip().lower() in ADMIN_DUTY_ROLES
+
+
+def _touch_admin_session(ref, data: dict) -> None:
+    if not _is_admin_role(data.get("role") or data.get("position")):
+        return
+    now = datetime.now(timezone.utc)
+    last = data.get("lastSeenAt")
+    if isinstance(last, datetime) and (now - last).total_seconds() < SESSION_TOUCH_SECONDS:
+        return
+    try:
+        ref.set({"lastSeenAt": now}, merge=True)
+    except Exception as exc:  # never fail a request over bookkeeping
+        print(f"[accounts] Could not record lastSeenAt: {exc}")
+
+
+def admin_session_is_live(data: dict) -> bool:
+    """True if this admin has made a request in the last SESSION_STALE_SECONDS."""
+    last = data.get("lastSeenAt")
+    if not isinstance(last, datetime):
+        return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last).total_seconds() <= SESSION_STALE_SECONDS
+
+
+def is_admin_available(data: dict) -> bool:
+    """Admin is explicitly on duty AND still has a live session. Use this (not
+    the raw duty field) when deciding who can receive a report."""
+    return (
+        _is_admin_role(data.get("role") or data.get("position"))
+        and _normalize_duty(data.get("duty")) == "on_duty"
+        and admin_session_is_live(data)
+        and data.get("disabled") is not True
+    )
+
+
+def set_admin_duty(db, account_id: str, duty: str) -> dict:
+    """
+    Single place that flips an admin's duty on login/logout. auth.py can import
+    and call this directly from its login/logout handlers.
+
+    Plain responders are left alone (they manage their own shift from the
+    mobile app). Going ON duty is refused for deactivated accounts, same rule
+    as PATCH /{id}/duty; going OFF duty is always allowed.
+    """
+    duty = _normalize_duty(duty)
+    ref = db.collection(RESPONDERS).document(account_id)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=403, detail="No account profile for this login")
+    data = snap.to_dict() or {}
+    role = str(data.get("role") or data.get("position") or "Responder").strip().lower()
+    if role not in ADMIN_DUTY_ROLES:
+        return {"accountId": account_id, "duty": _normalize_duty(data.get("duty")), "changed": False}
+
+    previous = _normalize_duty(data.get("duty"))
+    if duty == "on_duty" and _normalize_status(data.get("status")) == "inactive":
+        raise HTTPException(status_code=409, detail="Account is deactivated and cannot be placed on duty")
+
+    changed_at = datetime.now(timezone.utc)
+    update = {"duty": duty, "dutyChangedAt": changed_at}
+    if duty == "on_duty":
+        update["lastSeenAt"] = changed_at
+    ref.set(update, merge=True)
+    return {
+        "accountId": account_id,
+        "duty": duty,
+        "previousDuty": previous,
+        "changed": duty != previous,
+        "dutyChangedAt": changed_at,
+    }
 
 
 def _normalize_status(raw_status: str) -> str:
@@ -495,10 +591,10 @@ def _serialize(doc_id: str, data: dict) -> dict:
         "is_new": data.get("is_new", False),
     }
 
-    # duty is a plain-responder-only concept; super_admin/responder_admin
-    # report null so the UI can render a dash instead of a misleading
-    # "Off duty" badge.
+    # duty is reported for responders and admins (admins: set by web login/logout).
     account["duty"] = _normalize_duty(data.get("duty")) if has_duty else None
+    if account["duty"] == "on_duty" and _is_admin_role(role) and not admin_session_is_live(data):
+        account["duty"] = "off_duty"   # stored on_duty, but the session was abandoned
     account["dutyChangedAt"] = data.get("dutyChangedAt") if has_duty else None
 
     return account
@@ -643,8 +739,8 @@ def list_accounts(
     status_filter = _normalize_status(status) if status else None
     role_filter = role.strip().lower() if role else None
 
-    # A station admin only gets responders from their own station — never
-    # Admin / Super Admin accounts and never other stations.
+    # A station admin only gets accounts from their own station (responders AND
+    # the other admins of that station, themselves included) — never other stations.
     caller = _require_admin_caller(db, account["id"])
     station_admin_scope = caller["stationId"] if caller and caller["role"] == "responder_admin" else None
     scope_active = caller is not None and caller["role"] == "responder_admin"
@@ -653,26 +749,24 @@ def list_accounts(
     for doc in db.collection(RESPONDERS).stream():
         if (doc.to_dict() or {}).get("disabled") is True:
             continue   # "deleted" accounts stay in the database but are hidden
-        account = _serialize(doc.id, doc.to_dict() or {})
+        item = _serialize(doc.id, doc.to_dict() or {})   # not "account": that is the caller
 
         if scope_active:
-            if not station_admin_scope or str(account["stationId"] or "").strip() != station_admin_scope:
-                continue
-            if account["role"].strip().lower() in ADMIN_LEVEL_ROLES:
+            if not station_admin_scope or str(item["stationId"] or "").strip() != station_admin_scope:
                 continue
 
-        if role_filter and account["role"].strip().lower() != role_filter:
+        if role_filter and item["role"].strip().lower() != role_filter:
             continue
-        if status_filter and account["status"] != status_filter:
+        if status_filter and item["status"] != status_filter:
             continue
-        # A duty filter only ever matches plain responders, since duty is
-        # None for super_admin/responder_admin.
-        if duty_filter and account["duty"] != duty_filter:
+        # (duty filter now matches admins as well as responders)
+        if duty_filter and item["duty"] != duty_filter:
             continue
 
-        accounts.append(account)
+        accounts.append(item)
 
-    field_responders = [a for a in accounts if a["duty"] is not None]
+    # Tiles keep describing field responders only; admins now carry a duty value too.
+    field_responders = [a for a in accounts if a["role"].strip().lower() == "responder"]
     on_duty = [a for a in field_responders if a["duty"] == "on_duty"]
     responder_admins = [a for a in accounts if a["role"].strip().lower() == "responder_admin"]
     super_admins = [a for a in accounts if a["role"].strip().lower() == "super_admin"]
@@ -803,10 +897,9 @@ def update_account(account_id: DocIdPath, payload: AccountUpdate, account: dict 
     caller = _require_admin_caller(db, account["id"])
     if caller and caller["role"] == "responder_admin":
         if caller["id"] == account_id:
-            # Editing yourself (e.g. clearing is_new after a password change) is
-            # fine, but an admin can't change their own role, station or status.
-            for field in ("role", "stationId", "status"):
-                data.pop(field, None)
+            # A station admin cannot edit their own account from the Accounts page.
+            # The one exception is clearing is_new after a password change.
+            data = {k: v for k, v in data.items() if k == "is_new"}
         else:
             _assert_station_admin_may_manage(caller, existing)
             # Only role / unit / status — identity, station and password flags are ignored.
@@ -965,6 +1058,24 @@ def set_status(account_id: DocIdPath, payload: StatusUpdate, account: dict = Dep
     return {"accountId": account_id, "collection": RESPONDERS, **status_data}
 
 
+def _resolve_auth_uid(account_id: str, email: str) -> str | None:
+    """Firebase Auth uid for this account: the doc id if it is a real uid, else the user with the profile's email."""
+    try:
+        return firebase_auth.get_user(account_id).uid
+    except firebase_auth.UserNotFoundError:
+        pass
+    except Exception as err:
+        print(f"[accounts._resolve_auth_uid] get_user failed: {err.__class__.__name__}: {err}")
+    if email:
+        try:
+            return firebase_auth.get_user_by_email(email).uid
+        except firebase_auth.UserNotFoundError:
+            pass
+        except Exception as err:
+            print(f"[accounts._resolve_auth_uid] get_user_by_email failed: {err.__class__.__name__}: {err}")
+    return None
+
+
 @router.post("/{account_id}/reset-password")
 def reset_password(account_id: DocIdPath, account: dict = Depends(get_current_account)):
     """
@@ -980,10 +1091,26 @@ def reset_password(account_id: DocIdPath, account: dict = Depends(get_current_ac
 
     db = get_db()
     _require_super_admin(db, account["id"], "reset passwords")
-    ref, _ = _find_account(db, account_id)
+    ref, snapshot = _find_account(db, account_id)
+    email = str((snapshot.to_dict() or {}).get("email") or "").strip()
+
+    # Find the REAL Firebase Auth user: by doc id first, then by the profile's
+    # email, instead of assuming the two always line up.
+    auth_uid = _resolve_auth_uid(account_id, email)
+    if auth_uid is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No Firebase login exists for this account's id or email. Check the account's email.",
+        )
+
+    changes = {"password": DEFAULT_RESPONDER_PASSWORD}
+    if email:
+        # Keep the Auth email in step with the profile, because /auth/login signs in
+        # with the email stored on the profile.
+        changes["email"] = email
 
     try:
-        firebase_auth.update_user(account_id, password=DEFAULT_RESPONDER_PASSWORD)
+        firebase_auth.update_user(auth_uid, **changes)
     except Exception as err:
         # Covers firebase_admin.auth.UserNotFoundError (doc exists in
         # Firestore but has no matching Auth credential — e.g. a manually

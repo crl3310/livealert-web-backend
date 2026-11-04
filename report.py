@@ -4,14 +4,14 @@ import os
 import re
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import Field
 
 from accounts import get_station_scope, require_page, route_unassigned
 from firebase import get_db
 from history import (
     _bucket_video_urls, _find_incident_report_raw, _has_real_ai, _incident_report_out,
-    _remarks_out, _resolve_threat, _video_urls,
+    _remarks_out, _video_urls,
 )
 from units import _on_duty_responders
 from validation import (
@@ -109,6 +109,11 @@ def _to_dt(firestore_ts):
     return None
 
 
+def _iso(value: Any) -> str | None:
+    moment = _to_dt(value)
+    return moment.isoformat() if moment else None
+
+
 def _location_to_string(location: Any) -> str:
     if isinstance(location, str):
         return location
@@ -134,6 +139,20 @@ def _normalize_threat(threat: Any) -> str:
     if str(threat).strip().isdigit():
         return f"Level {str(threat).strip()}"
     return str(threat)
+
+
+def _resolve_live_threat(data: dict[str, Any]) -> tuple[str, Any]:
+    """(label, threatLevel to send) for the live report page. Decided by `threatLevel` alone:
+    "fake" -> Fake | 0 / empty / missing -> Unknown | 1-4 -> "Level n"."""
+    raw = data.get("threatLevel")
+    if isinstance(raw, float) and raw.is_integer():
+        raw = int(raw)
+    text = "" if raw is None else str(raw).strip()
+    if text.lower() == "fake":
+        return "Fake", "fake"
+    if not text or re.fullmatch(r"(level\s*)?0+", text, re.IGNORECASE) or text.lower() == "unknown":
+        return "Unknown", None
+    return _normalize_threat(raw), raw
 
 
 # The threatLevel stored on a new report is only a default (it was showing "Level 2" at once). Until the
@@ -256,8 +275,8 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media
     )
 
     # The level stored on a report is only a default until the AI has assessed it, so it is not shown as-is:
-    # Fake (AI rejected it), Unknown (not assessed / inconclusive) or the real level. See history._resolve_threat.
-    threat_label, threat_level = _resolve_threat(data)
+    # Fake / Unknown / real level, decided by threatLevel alone (see _resolve_live_threat).
+    threat_label, threat_level = _resolve_live_threat(data)
 
     # The responder's IncidentReport (a map on the report document). Only on the detail view: it looks up unit names.
     incident_report = _incident_report_out(_find_incident_report_raw(None, data), db) if sign_media else None
@@ -276,10 +295,9 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media
         "status": data.get("status", "pending"),
         "aiSummary": data.get("ai_summary"),
         "aiReasoning": data.get("ai_reasoning"),
-        # AI verdict fields, passed through exactly as stored so the frontend (LiveAlertAI.getConfidence /
-        # isFlaggedFake) can read them. Do NOT use `or` fallbacks here: a confidence of 0 is a real value.
+        # AI confidence, passed through exactly as stored so the frontend (LiveAlertAI.getConfidence)
+        # can read it. Do NOT use `or` fallbacks here: a confidence of 0 is a real value.
         "aiEmergencyConfidence": data.get("aiEmergencyConfidence"),
-        "aiFlaggedFake": data.get("aiFlaggedFake") is True,
         "aiMode": data.get("aiMode"),
         "aiAssessment": data.get("ai_assessment"),
         "nearestStationId": data.get("nearestStationId") or assigned_station.get("stationId", ""),
@@ -311,11 +329,69 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any, sign_media
         "deployedUnits": data.get("deployedUnits") or [],
         # Set when another station passed this report on (from the last forwardHistory entry).
         "forwardedFrom": _forward_out(data),
+        # Which admin has this report ("" = nobody yet) and whether it is waiting in the station queue.
+        # queuePosition (1 = next up) is filled in by /reports/recent, where the whole queue is known.
+        "assignedAdminId": assigned_admin_id(data),
+        "assignedAdminName": assigned_station.get("assignedAdminName") or "",
+        "queueState": data.get("queueState") or "",
+        "queuedAt": _iso(data.get("queuedAt")),
+        "queuePosition": None,
+        # Set when no station could take this report (every station is out of units).
+        "capacityAlert": {"at": _iso((data.get("capacityAlert") or {}).get("at")),
+                          "reason": (data.get("capacityAlert") or {}).get("reason", "")}
+                         if isinstance(data.get("capacityAlert"), dict) else None,
         "deployedResponders": data.get("deployedResponders") or [],
         "incidentReport": incident_report,
         "videoUrls": _video_urls(data, sign=sign_media),
         "evidenceUploadedAt": data.get("evidence_uploaded_at") and _to_dt(data.get("evidence_uploaded_at")) and _to_dt(data.get("evidence_uploaded_at")).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Report queue (see dispatch_queue.py)
+# ---------------------------------------------------------------------------
+# Queue order: highest threat level first (4 down to 1), then the report that has waited longest.
+# A report whose AI assessment has not arrived yet, or whose level is unknown, ranks as this level
+# (it is the same default a new report is stored with). "Fake" ranks below level 1.
+UNKNOWN_THREAT_PRIORITY = 2
+
+# Which admin has the report lives INSIDE assignedStation, next to the station it belongs to, so it is
+# replaced together with the station when the report is forwarded: assignedStation.{assignedAdminId,
+# assignedAdminName, assignedAt}. The waiting-list state stays on the document itself.
+ADMIN_KEYS = ("assignedAdminId", "assignedAdminName", "assignedAt")
+QUEUE_FIELDS = ("queueState", "queuedAt", "capacityAlert")
+
+
+def assigned_admin_id(data: dict[str, Any]) -> str:
+    return str((data.get("assignedStation") or {}).get("assignedAdminId") or "")
+
+
+def admin_clear_fields() -> dict[str, Any]:
+    """Update paths that remove the admin from assignedStation without touching its other keys."""
+    return {f"assignedStation.{key}": firestore.DELETE_FIELD for key in ADMIN_KEYS}
+
+
+def queue_priority(data: dict[str, Any]) -> int:
+    """4 (most urgent) .. 1, 0 = fake. Unknown / still being assessed = UNKNOWN_THREAT_PRIORITY."""
+    if _is_ai_pending(data, _created_datetime(data)):
+        return UNKNOWN_THREAT_PRIORITY
+    label, _ = _resolve_live_threat(data)
+    if label == "Fake":
+        return 0
+    match = re.search(r"\d+", label)
+    level = int(match.group()) if match else None
+    return level if level in (1, 2, 3, 4) else UNKNOWN_THREAT_PRIORITY
+
+
+def queue_sort_key(doc_id: str, data: dict[str, Any]) -> tuple:
+    """Smaller sorts first: higher threat, then older report, then id (so the order is stable)."""
+    created = _created_datetime(data) or datetime.max.replace(tzinfo=timezone.utc)
+    return (-queue_priority(data), created, doc_id)
+
+
+def _queue_reset_fields() -> dict[str, Any]:
+    """Wipes the admin assignment / queue state, e.g. when a report moves to another station."""
+    return {**admin_clear_fields(), **{name: firestore.DELETE_FIELD for name in QUEUE_FIELDS}}
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +629,13 @@ def get_recent_reports(station_id: str | None = Depends(get_station_scope)):
     docs.sort(key=_sort_key, reverse=True)
 
     reports = [_build_report_payload(doc.id, doc.to_dict() or {}, db) for doc in docs]
+
+    # 1 = next report to be handed to a free admin.
+    waiting = sorted((d for d in docs if (d.to_dict() or {}).get("queueState") == "queued"),
+                     key=lambda d: queue_sort_key(d.id, d.to_dict() or {}))
+    position = {d.id: n for n, d in enumerate(waiting, start=1)}
+    for report in reports:
+        report["queuePosition"] = position.get(report["id"])
     return {"reports": reports}
 
 
@@ -610,6 +693,8 @@ def forward_report(
     assigned = dict(old_assigned)
     assigned.update({"stationId": target_id, "stationName": target.get("stationName") or target_id, "unitIds": []})
     assigned.pop("unitId", None)
+    for key in ADMIN_KEYS:   # the old station's admin does not follow the report
+        assigned.pop(key, None)
     if target.get("commanderName"):
         assigned["commanderName"] = target["commanderName"]
     else:
@@ -628,6 +713,9 @@ def forward_report(
         "nearestStationId": target_id,
         "assignedStation": assigned,
         "forwardHistory": firestore.ArrayUnion([hop]),
+        # The new station's queue starts from scratch: not waiting yet. (The admin was dropped
+        # from assignedStation above.)
+        **{name: firestore.DELETE_FIELD for name in QUEUE_FIELDS},
     })
     return {"forwarded": True, "reportId": report_id, "toStation": chosen}
 
@@ -655,6 +743,7 @@ def get_report_detail(report_id: DocIdPath, station_id: str | None = Depends(get
 def update_report(
     report_id: DocIdPath,
     payload: ReportUpdate,
+    background_tasks: BackgroundTasks,
     station_id: str | None = Depends(get_station_scope),
     _: dict = Depends(require_page("report")),
 ):
@@ -759,15 +848,26 @@ def update_report(
         # Read-merge-write against the live doc (rather than trusting a
         # client-supplied assignedStation object) so we never clobber sibling
         # fields like stationName/commanderName/dispatchStatus.
-        assigned_station = dict(existing_assigned)
-        assigned_station["unitIds"] = unit_ids
-        assigned_station.pop("unitId", None)  # drop the legacy single-unit field
-        data["assignedStation"] = assigned_station
+        # Only the unit keys are written (as update paths), so sibling fields, including the admin
+        # the queue assigned, are never overwritten.
+        data["assignedStation.unitIds"] = unit_ids
+        data["assignedStation.unitId"] = firestore.DELETE_FIELD  # drop the legacy single-unit field
 
         # Clean up the legacy top-level "unitId" field from older docs.
         if "unitId" in existing_data:
             data["unitId"] = firestore.DELETE_FIELD
 
+    # Manually moving a report to another station hands it to that station's queue.
+    new_station = str(data.get("nearestStationId") or "").strip()
+    if new_station and new_station != _report_station_id(existing_data):
+        data.update(_queue_reset_fields())
+
     if data:
         ref.update(data)
+
+    # A report that just ended frees its admin: hand the next queued report on without
+    # waiting for the next scheduled queue pass.
+    if data.get("endedAt") is not None and data["endedAt"] is not firestore.DELETE_FIELD:
+        from dispatch_queue import run_dispatch_pass  # imported here: dispatch_queue imports this module
+        background_tasks.add_task(run_dispatch_pass)
     return {"updated": True, "reportId": report_id}

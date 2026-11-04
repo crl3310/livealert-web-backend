@@ -20,6 +20,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from firebase_admin import auth as firebase_auth
 from google.api_core.exceptions import GoogleAPICallError
 
+from accounts import set_admin_duty
 from config import FIREBASE_AUTH_URL, API_KEY
 from firebase import get_db
 from security import get_verified_token
@@ -161,7 +162,7 @@ def _raise_firestore_unavailable(exc: Exception) -> None:
     turns it into a 503 the frontend's existing try/catch blocks already
     know how to display. Always raises; never returns.
     """
-    print(f"[Firestore error] {exc.__class__.__name__}: {exc}")  # TEMP DEBUG — remove once diagnosed
+
     detail = "Database temporarily unavailable. Please try again in a moment."
     if isinstance(exc, GoogleAPICallError):
         detail = f"Database temporarily unavailable ({exc.__class__.__name__}). Please try again in a moment."
@@ -320,6 +321,8 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
     except Exception as exc:
         _raise_firestore_unavailable(exc)
 
+  
+
     if not email:
         # Unknown badge, no email on file, or email login switched off: answer
         # exactly like a wrong password.
@@ -385,6 +388,17 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
             is_new = bool((responder_snap.to_dict() or {}).get("is_new", False))
         except Exception as exc:
             print(f"[auth.login] Firestore bookkeeping failed for {auth_user_id}, continuing with defaults: {exc}")
+
+        # Admins go ON duty when they log in, so the report queue knows who can
+        # receive reports. Plain responders (mobile app) are ignored by
+        # set_admin_duty. Someone still on the temporary password has not
+        # finished setting up, so they are not put on duty yet. A failure here
+        # must never fail an otherwise valid login.
+        if not is_new:
+            try:
+                set_admin_duty(get_db(), auth_user_id, "on_duty")
+            except Exception as exc:
+                print(f"[auth.login] Could not set on_duty for {auth_user_id}: {exc}")
 
     return {
         "status": "success",
@@ -458,6 +472,13 @@ async def change_password(payload: ChangePasswordRequest):
             # screen once more than necessary.
             print(f"[auth.change_password] Could not clear is_new for {user_id}: {exc}")
 
+        # login() skips the on-duty step while is_new is set, and the frontend
+        # continues straight to the dashboard from here, so put admins on duty now.
+        try:
+            set_admin_duty(get_db(), user_id, "on_duty")
+        except Exception as exc:
+            print(f"[auth.change_password] Could not set on_duty for {user_id}: {exc}")
+
     return {
         "status": "success",
         "message": "Password updated.",
@@ -523,6 +544,13 @@ def logout(token: dict = Depends(get_verified_token)):
     except Exception as exc:
         print(f"[auth.logout] Could not revoke tokens for {uid}: {exc.__class__.__name__}: {exc}")
         raise HTTPException(status_code=503, detail="Could not log out right now. Please try again.")
+
+    # Admins go OFF duty on logout (no-op for plain responders). Done after the
+    # revoke succeeds, and never allowed to fail the logout itself.
+    try:
+        set_admin_duty(get_db(), uid, "off_duty")
+    except Exception as exc:
+        print(f"[auth.logout] Could not set off_duty for {uid}: {exc}")
 
     return {"status": "success", "message": "Logged out."}
 

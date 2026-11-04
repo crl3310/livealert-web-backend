@@ -7,12 +7,14 @@ Run this to start everything:
 API Docs: http://localhost:8000/docs
 """
 
+import asyncio
 import os
 import socket
 import subprocess
 import sys
 import time
 import uvicorn
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dashboard import router as dashboard_router
@@ -27,11 +29,23 @@ from hazard import router as hazard_router
 from maps_config import router as maps_config_router
 from validation import install_validation_handlers, BodySizeLimitMiddleware
 from chat import router as chat_router
+from dispatch_queue import dispatch_loop
 
 
 IS_PROD = os.getenv("ENVIRONMENT") == "production"
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Runs the report queue (admin assignment / waiting list / auto-forward) in the background."""
+    task = asyncio.create_task(dispatch_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="LiveAlert API",
     version="1.0.0",
     docs_url=None if IS_PROD else "/docs",
