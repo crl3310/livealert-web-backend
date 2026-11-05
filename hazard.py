@@ -15,6 +15,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import StreamingResponse
 from accounts import get_current_account, get_station_scope
 from firebase import get_db
+from ratelimit import limiter, acquire_stream, release_stream
+from security import get_verified_token
 
 router = APIRouter(prefix="/hazards", tags=["Hazards"])
 
@@ -281,6 +283,7 @@ def list_hazards(station_id: str | None = Depends(get_station_scope)):
 
 
 @router.patch("/{hazard_id}/resolve")
+@limiter.limit("20/minute")
 def resolve_hazard(
     hazard_id: str,
     request: Request,
@@ -428,7 +431,11 @@ def hazard_images(hazard_id: str, station_id: str | None = Depends(get_station_s
 
 
 @router.get("/live-updates")
-async def hazard_live_updates(request: Request, station_id: str | None = Depends(get_station_scope)):
+async def hazard_live_updates(
+    request: Request,
+    station_id: str | None = Depends(get_station_scope),
+    token: dict = Depends(get_verified_token),
+):
     """
     SSE endpoint for real-time hazard updates (consumed with fetch streams), filtered by station scope.
     Sends the full hazard for added/modified documents and {"id", "action": "remove"} when a hazard
@@ -454,6 +461,7 @@ async def hazard_live_updates(request: Request, station_id: str | None = Depends
 
             loop.call_soon_threadsafe(queue.put_nowait, payload)
 
+    slot = acquire_stream(token["uid"], "hazard-live")
     watch = db.collection("Hazards").on_snapshot(snapshot_callback)
 
     async def event_stream():
@@ -468,6 +476,7 @@ async def hazard_live_updates(request: Request, station_id: str | None = Depends
                     yield ": keep-alive\n\n"
         finally:
             watch.unsubscribe()
+            release_stream(token["uid"], "hazard-live", slot)
 
     return StreamingResponse(
         event_stream(),

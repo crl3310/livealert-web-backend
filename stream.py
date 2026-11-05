@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from math import radians, sin, cos, sqrt, atan2
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from agora_token_builder import RtcTokenBuilder
 
@@ -33,6 +33,7 @@ from security import get_verified_token
 from config import AGORA_APP_ID, AGORA_APP_CERTIFICATE
 from firebase import get_db
 from validation import ChannelIdPath, DocIdPath
+from ratelimit import limiter, acquire_stream, release_stream
 
 router = APIRouter(prefix="/stream", tags=["Stream"])
 
@@ -165,7 +166,10 @@ def _generate_agora_token(channel_id: str, uid: int = 0, expiration_seconds: int
 # ── Real-Time SSE Updates ─────────────────────────────────────────────────────
 
 @router.get("/live-updates")
-async def live_updates(station_id: str = Depends(get_station_scope)):
+async def live_updates(
+    station_id: str = Depends(get_station_scope),
+    token: dict = Depends(get_verified_token),
+):
     """
     Server-Sent Events (SSE) endpoint, scoped to the caller's station.
     Only calls routed to the caller's station are pushed; everything else is
@@ -199,6 +203,7 @@ async def live_updates(station_id: str = Depends(get_station_scope)):
             data["id"] = doc.id
             loop.call_soon_threadsafe(queue.put_nowait, data)
 
+    slot = acquire_stream(token["uid"], "live-updates")   # 429 if this user has too many open
     query_watch = db.collection("ActiveCalls").on_snapshot(snapshot_callback)
 
     async def event_generator():
@@ -210,6 +215,7 @@ async def live_updates(station_id: str = Depends(get_station_scope)):
             pass
         finally:
             query_watch.unsubscribe()
+            release_stream(token["uid"], "live-updates", slot)
 
     return StreamingResponse(
         event_generator(),
@@ -225,7 +231,9 @@ async def live_updates(station_id: str = Depends(get_station_scope)):
 # ── Create Stream ─────────────────────────────────────────────────────────────
 
 @router.post("/create/{emergency_id}")
+@limiter.limit("10/minute")
 def create_stream(
+    request: Request,
     emergency_id: DocIdPath,
     station_id: str = Depends(get_station_scope),
     _: dict = Depends(require_page("dashboard")),
@@ -257,7 +265,8 @@ def create_stream(
 # ── Get Token ─────────────────────────────────────────────────────────────────
 
 @router.get("/token/{channel_id}")
-def get_stream_token(channel_id: ChannelIdPath, _: dict = Depends(get_verified_token)):
+@limiter.limit("20/minute")
+def get_stream_token(request: Request, channel_id: ChannelIdPath, _: dict = Depends(get_verified_token)):
     """Get a dynamic token for joining an Agora channel."""
     try:
         token = _generate_agora_token(channel_id)
@@ -759,7 +768,11 @@ def get_user_location(emergency_id: DocIdPath, station_id: str | None = Depends(
 
 
 @router.get("/{emergency_id}/user-location/stream")
-async def user_location_stream(emergency_id: DocIdPath, station_id: str | None = Depends(get_station_scope)):
+async def user_location_stream(
+    emergency_id: DocIdPath,
+    station_id: str | None = Depends(get_station_scope),
+    token: dict = Depends(get_verified_token),
+):
     """
     Server-Sent Events: the reporter's position, pushed the moment it changes.
     The first event is the current position; after that, one event per real change (the call document also
@@ -785,6 +798,7 @@ async def user_location_stream(emergency_id: DocIdPath, station_id: str | None =
             last["sig"] = sig
             loop.call_soon_threadsafe(queue.put_nowait, payload)
 
+    slot = acquire_stream(token["uid"], "user-location")
     watch = call_ref.on_snapshot(doc_callback)
 
     async def event_generator():
@@ -802,6 +816,7 @@ async def user_location_stream(emergency_id: DocIdPath, station_id: str | None =
             pass
         finally:
             watch.unsubscribe()
+            release_stream(token["uid"], "user-location", slot)
 
     return StreamingResponse(
         event_generator(),

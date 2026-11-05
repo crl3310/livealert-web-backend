@@ -281,8 +281,6 @@ def run_dispatch_pass() -> dict[str, int] | None:
         if not _acquire_lease(db):
             return None
         stats = _run(db)
-        if any(stats.values()):
-            print(f"[dispatch_queue] {stats}")
         return stats
     except Exception as exc:  # a failed pass must never take the server down; the next one retries
         print(f"[dispatch_queue] pass failed: {exc.__class__.__name__}: {exc}")

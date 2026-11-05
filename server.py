@@ -30,7 +30,9 @@ from maps_config import router as maps_config_router
 from validation import install_validation_handlers, BodySizeLimitMiddleware
 from chat import router as chat_router
 from dispatch_queue import dispatch_loop
-
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from ratelimit import limiter, rate_limit_exceeded_handler
 
 IS_PROD = os.getenv("ENVIRONMENT") == "production"
 
@@ -55,6 +57,10 @@ app = FastAPI(
 
 # 422 responses that never echo submitted input (e.g. passwords) back to the client.
 install_validation_handlers(app)
+
+# Rate limiting (see ratelimit.py).
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
 
 
 @app.middleware("http")
@@ -84,6 +90,9 @@ ALLOWED_ORIGINS = ["https://livealert.tech","https://www.livealert.tech",]
 # Uncomment while developing locally:
 #ALLOWED_ORIGINS = ["http://localhost:5500", "http://127.0.0.1:5500"]
 
+# Applies the default rate limit to every route. Added before CORS so a 429 still carries CORS headers.
+app.add_middleware(SlowAPIMiddleware)
+
 # Added BEFORE CORS so CORS wraps it: an oversized request gets a clean 413 the browser can read.
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=256 * 1024)
 
@@ -108,15 +117,18 @@ app.include_router(maps_config_router, prefix="/api/v1")
 app.include_router(chat_router, prefix="/api/v1")
 
 @app.get("/")
+@limiter.exempt
 def root():
     return {"status": "ok", "service": "LiveAlert API v1.0.0"}
 
 
 @app.get("/health")
+@limiter.exempt
 def health():
     return {"status": "healthy", "service": "LiveAlert API"}
 
 @app.get("/api/v1/health")
+@limiter.exempt
 def frontend_health():
     return {"status": "healthy", "service": "LiveAlert API"}
 

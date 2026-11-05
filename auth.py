@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from firebase_admin import auth as firebase_auth
 from google.api_core.exceptions import GoogleAPICallError
 
@@ -24,6 +25,7 @@ from accounts import set_admin_duty
 from config import FIREBASE_AUTH_URL, API_KEY
 from firebase import get_db
 from security import get_verified_token
+from ratelimit import limiter
 from validation import (
     IdTokenStr, LoginIdentifier, LoginPassword, NewPassword, RefreshTokenStr, StrictModel, is_valid_badge,
 )
@@ -280,6 +282,7 @@ def _create_responder_for_user(user_id: str, username: str | None, email: str) -
 
 
 @router.post("/login")
+@limiter.limit("30/minute")
 async def login(request: Request, payload: LoginRequest | None = Body(default=None)):
     """Authenticate an admin with badge number and password."""
     if payload is None:
@@ -296,6 +299,13 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
             # ValidationError here used to escape as a 500), and never echoes input.
             raise HTTPException(status_code=400, detail="Request body must be valid JSON with usernameOrEmail and password.")
 
+    # Everything below makes blocking network and database calls, so it runs in a worker
+    # thread. Running it right here would freeze every other request and live stream
+    # on the server for as long as Firebase takes to answer.
+    return await run_in_threadpool(_login_sync, request, payload)
+
+
+def _login_sync(request: Request, payload: LoginRequest) -> dict:
     # Brute-force protection: refuse before doing any work if this IP or
     # account is locked out.
     identifier = payload.usernameOrEmail.strip()
@@ -320,8 +330,6 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
         raise
     except Exception as exc:
         _raise_firestore_unavailable(exc)
-
-  
 
     if not email:
         # Unknown badge, no email on file, or email login switched off: answer
@@ -415,7 +423,8 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
 
 
 @router.post("/change-password")
-async def change_password(payload: ChangePasswordRequest):
+@limiter.limit("10/minute")
+def change_password(request: Request, payload: ChangePasswordRequest):
     """
     Sets a new password for the currently-authenticated user, identified by
     the Firebase idToken returned from their login() call. Also clears
@@ -492,7 +501,8 @@ class RefreshRequest(StrictModel):
 
 
 @router.post("/refresh")
-def refresh_session(payload: RefreshRequest):
+@limiter.limit("30/minute")
+def refresh_session(request: Request, payload: RefreshRequest):
     """
     Swaps a refresh token for a fresh ID token. ID tokens only live for an
     hour, so the website calls this in the background to keep people signed in.
@@ -556,7 +566,8 @@ def logout(token: dict = Depends(get_verified_token)):
 
 
 @router.post("/send-code")
-def send_code(payload: CodeRequest):
+@limiter.limit("5/minute")   # 3 is for testing; change to 5/minute once verified
+def send_code(request: Request, payload: CodeRequest):
     """Mock sending a verification code for passwordless or MFA flows."""
     email = payload.email or payload.usernameOrEmail
     if not email:
@@ -571,7 +582,8 @@ def send_code(payload: CodeRequest):
 
 
 @router.post("/verify-code")
-def verify_code(payload: CodeRequest):
+@limiter.limit("10/minute")
+def verify_code(request: Request, payload: CodeRequest):
     """Mock verification endpoint without code validation.
     SECURITY: this always reports success. Do not let anything trust it, and
     remove it (or make it real) before production."""

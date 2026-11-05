@@ -28,13 +28,15 @@ import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from firebase_admin import firestore
 from pydantic import Field
 
 from accounts import admin_only, get_station_scope
 from firebase import get_db
+from ratelimit import limiter, acquire_stream, release_stream
+from security import get_verified_token
 from validation import DocIdPath, DocIdStr, StrictModel
 
 log = logging.getLogger(__name__)
@@ -102,7 +104,9 @@ def _serialize(doc) -> dict:
 # Admin sends a message
 # ---------------------------------------------------------------------------
 @router.post("/send", status_code=201)
+@limiter.limit("30/minute")
 def chat_send(
+    request: Request,
     payload: ChatSend,
     account: dict = Depends(admin_only),
     station_id: str = Depends(get_station_scope),
@@ -190,6 +194,7 @@ async def chat_stream(
     call_id: DocIdPath,
     _: dict = Depends(admin_only),
     station_id: str = Depends(get_station_scope),
+    token: dict = Depends(get_verified_token),
 ):
     call_ref, _call = await asyncio.get_running_loop().run_in_executor(None, _load_call, call_id, station_id)
 
@@ -204,6 +209,7 @@ async def chat_stream(
             loop.call_soon_threadsafe(queue.put_nowait, _serialize(change.document))
 
     query = call_ref.collection("Messages").order_by("createdAt", direction=firestore.Query.DESCENDING).limit(MAX_PAGE)
+    slot = acquire_stream(token["uid"], "chat-stream")
     watch = query.on_snapshot(snapshot_callback)
 
     async def event_generator():
@@ -218,6 +224,7 @@ async def chat_stream(
             pass
         finally:
             watch.unsubscribe()
+            release_stream(token["uid"], "chat-stream", slot)
 
     return StreamingResponse(
         event_generator(),
