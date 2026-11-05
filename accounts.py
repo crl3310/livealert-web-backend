@@ -1,3 +1,4 @@
+import os
 import re
 from datetime import datetime, timezone
 from math import atan2, cos, radians, sin, sqrt
@@ -336,11 +337,16 @@ super_admin_only = _role_gate(*FULL_ACCESS_ROLES)
 
 RESPONDERS = "Responders"
 
-# Same default auth.py already applies when signup() is called with no
-# password (see the comment in accounts.js about DEFAULT_RESPONDER_PASSWORD).
-# Kept here too so /accounts/{id}/reset-password can put an account back to
-# the same starting point without needing to import from auth.py.
-DEFAULT_RESPONDER_PASSWORD = "default123"
+# Temporary password given to new accounts and restored by /reset-password.
+# It comes from the environment so it is not in source control. There is no
+# fallback on purpose: a missing value must stop the app, not silently fall
+# back to a known password. Keep it in step with auth.py's signup() default
+# (ideally by importing this constant there instead of repeating the value).
+DEFAULT_RESPONDER_PASSWORD = os.environ.get("DEFAULT_RESPONDER_PASSWORD", "").strip()
+if len(DEFAULT_RESPONDER_PASSWORD) < 8:   # Firebase's minimum is 6; 8+ is safer
+    raise RuntimeError(
+        "DEFAULT_RESPONDER_PASSWORD must be set in the environment (at least 8 characters)."
+    )
 
 try:
     from firebase_admin import auth as firebase_auth
