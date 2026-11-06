@@ -1,11 +1,16 @@
+import hmac
 import os
 import re
+import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
 from math import atan2, cos, radians, sin, sqrt
 from typing import Any, ClassVar
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import Field
 
 from firebase import get_db
 from security import get_verified_token
@@ -348,6 +353,49 @@ if len(DEFAULT_RESPONDER_PASSWORD) < 8:   # Firebase's minimum is 6; 8+ is safer
         "DEFAULT_RESPONDER_PASSWORD must be set in the environment (at least 8 characters)."
     )
 
+def is_default_password(candidate: str | None) -> bool:
+    """
+    True if `candidate` is exactly the temporary password given to new accounts.
+
+    The one place that decides this, so the website never has to know the value.
+    Compared in constant time (hmac.compare_digest on bytes, so non-ASCII input
+    is fine) so the answer can't be probed through response timing. auth.py's
+    /auth/change-password should call this too, to refuse the default as a new
+    password no matter what the browser sends.
+    """
+    return hmac.compare_digest(
+        (candidate or "").encode("utf-8"),
+        DEFAULT_RESPONDER_PASSWORD.encode("utf-8"),
+    )
+
+
+# /me/password-check tells the caller whether a guess equals the shared default
+# password, so it is throttled per account: a few checks while someone types a new
+# password is normal, hundreds are someone guessing. In-memory, so each server
+# process counts on its own; use a shared store (Redis) if you run several workers
+# and want one combined limit.
+PASSWORD_CHECK_LIMIT = 20            # checks allowed ...
+PASSWORD_CHECK_WINDOW_SECONDS = 60   # ... per account, per this many seconds
+_password_check_hits: dict[str, deque] = {}
+_password_check_lock = threading.Lock()
+
+
+def _throttle_password_check(account_id: str) -> None:
+    now = time.monotonic()
+    with _password_check_lock:
+        hits = _password_check_hits.setdefault(account_id, deque())
+        while hits and now - hits[0] > PASSWORD_CHECK_WINDOW_SECONDS:
+            hits.popleft()
+        if len(hits) >= PASSWORD_CHECK_LIMIT:
+            retry_after = int(PASSWORD_CHECK_WINDOW_SECONDS - (now - hits[0])) + 1
+            raise HTTPException(
+                status_code=429,
+                detail="Too many password checks. Please wait a moment and try again.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        hits.append(now)
+
+
 try:
     from firebase_admin import auth as firebase_auth
 except ImportError:  # pragma: no cover - firebase_admin should already be a
@@ -439,6 +487,11 @@ class StatusUpdate(StrictModel):
 
 class DutyUpdate(StrictModel):
     duty: DutyValue | None = None  # omit to flip whatever is currently stored
+
+
+class PasswordCheck(StrictModel):
+    # Capped so nobody can post a huge body just to be hashed/compared.
+    password: str = Field(min_length=1, max_length=128)
 
 
 # Admin-level roles are put on duty automatically when they log in to the web
@@ -717,6 +770,30 @@ def get_my_permissions(account: dict = Depends(get_current_account)):
         "role": account["role"],
         "pages": sorted(allowed) if allowed is not None else None,
     }
+
+
+@router.post("/me/password-check")
+def check_my_password(payload: PasswordCheck, account: dict = Depends(get_current_account)):
+    """
+    Tells the change-password page whether a password the user is typing is the
+    default one, so the website doesn't need the default written in its code.
+    Body: {"password": "..."}   ->   {"isDefault": true | false}
+
+    Guards, because the answer reveals the shared default password to anyone who
+    can guess it:
+      * a valid login is required (get_current_account);
+      * throttled per account (429 + Retry-After);
+      * only for accounts that still have is_new set, i.e. people who were just
+        given the default and already know it. Everyone else gets 403.
+    The password is never stored or logged.
+    """
+    _throttle_password_check(account["id"])
+
+    snapshot = get_db().collection(RESPONDERS).document(account["id"]).get()
+    if (snapshot.to_dict() or {}).get("is_new") is not True:
+        raise HTTPException(status_code=403, detail="This check is only available while you still need to set a new password.")
+
+    return {"isDefault": is_default_password(payload.password)}
 
 
 @router.get("")
