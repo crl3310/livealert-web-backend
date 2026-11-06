@@ -1,10 +1,3 @@
-"""
-LiveAlert — Auth Router
-========================
-Implements backend endpoints for frontend auth API calls.
-Uses Firebase Identity Toolkit REST endpoints to sign users in and sign them up.
-"""
-
 import json
 import os
 import threading
@@ -34,40 +27,13 @@ MAX_LOGIN_BODY_BYTES = 8 * 1024
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
-
-# ---------------------------------------------------------------------------
-# Login brute-force protection
-#
-# Failed logins (wrong password / unknown user) are counted per ACCOUNT and per
-# client IP inside a sliding window. Hitting a limit locks that key out for
-# LOGIN_LOCKOUT_SEC and /auth/login answers 429 + Retry-After without even
-# contacting Firebase. A successful login clears the account's counter (never
-# the IP's, so someone with one valid account can't reset their own attack on
-# others). State is in memory: it resets on restart and isn't shared between
-# multiple worker processes (see notes if you ever run more than one).
-# ---------------------------------------------------------------------------
-LOGIN_MAX_FAILS_PER_ACCOUNT = 5     # wrong attempts allowed per account...
-LOGIN_MAX_FAILS_PER_IP = 20         # ...and per IP (higher: offices share one IP)
-LOGIN_WINDOW_SEC = 15 * 60          # failures older than this are forgotten
-LOGIN_LOCKOUT_SEC = 15 * 60         # how long a locked key stays blocked
-
-# Only set LOGIN_TRUST_PROXY=1 when the API sits behind a reverse proxy you
-# control (nginx, Cloudflare, ...). X-Forwarded-For is trivially spoofable
-# otherwise, which would let an attacker dodge the per-IP limit.
+LOGIN_MAX_FAILS_PER_ACCOUNT = 5    
+LOGIN_MAX_FAILS_PER_IP = 20        
+LOGIN_WINDOW_SEC = 15 * 60          
+LOGIN_LOCKOUT_SEC = 15 * 60       
 TRUST_PROXY_HEADERS = os.getenv("LOGIN_TRUST_PROXY", "0").lower() in {"1", "true", "yes", "on"}
-
-# Admins now sign in with their BADGE NUMBER (sent in the same JSON field the
-# page always used, "usernameOrEmail"). Email login is switched off by default.
-# Set LOGIN_ALLOW_EMAIL=1 only if something (e.g. the mobile app) still signs in
-# with an email through this endpoint while you migrate it.
 ALLOW_EMAIL_LOGIN = os.getenv("LOGIN_ALLOW_EMAIL", "0").lower() in {"1", "true", "yes", "on"}
-
-# The ONE error every failed login gets, whether the badge doesn't exist, the
-# password is wrong, or the account has no email. Same status + same text means
-# nobody can probe which badge numbers are real.
 _GENERIC_BAD_LOGIN = "INVALID_LOGIN_CREDENTIALS"
-
-# Firebase error codes that mean "these credentials are wrong".
 _BAD_CREDENTIAL_CODES = ("INVALID_PASSWORD", "EMAIL_NOT_FOUND", "INVALID_LOGIN_CREDENTIALS")
 
 
@@ -170,13 +136,21 @@ def _raise_firestore_unavailable(exc: Exception) -> None:
         detail = f"Database temporarily unavailable ({exc.__class__.__name__}). Please try again in a moment."
     raise HTTPException(status_code=503, detail=detail) from exc
 
-# Universal default password for admin-created responder accounts. The
-# Accounts page doesn't send a password at all when registering an officer —
-# the officer isn't choosing it, and the admin isn't the one using it, so
-# there's nothing for the frontend to actually own here. This is the single
-# source of truth for that value; is_new (see login()/change-password below)
-# is what forces it to actually get changed once the responder logs in.
-DEFAULT_RESPONDER_PASSWORD = "default123"
+# Default password for admin-created responder accounts. The Accounts page
+# doesn't send a password at all when registering an officer — the officer
+# isn't choosing it, and the admin isn't the one using it, so there's nothing
+# for the frontend to actually own here. The value now lives ONLY in the
+# environment (.env -> DEFAULT_RESPONDER_PASSWORD), never in source code.
+# is_new (see login()/change-password below) is what forces it to actually get
+# changed once the responder logs in.
+DEFAULT_RESPONDER_PASSWORD = os.getenv("DEFAULT_RESPONDER_PASSWORD", "").strip()
+if len(DEFAULT_RESPONDER_PASSWORD) < 8:
+    # Fail at startup instead of silently creating accounts with a blank/weak
+    # password. (Firebase also rejects anything under 6 characters.)
+    raise RuntimeError(
+        "DEFAULT_RESPONDER_PASSWORD is missing or shorter than 8 characters. "
+        "Set it in your .env file."
+    )
 
 
 class LoginRequest(StrictModel):
